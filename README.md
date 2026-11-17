@@ -135,6 +135,7 @@ So that you notice if a malicious program modified that folder beforehand:
 - TOTP: base32 and `otpauth://` only (SHA1, SHA256, SHA512). Steam Guard (`steam://`) is not supported.
 - `rbw edit`, `remove` and `search` do not work. `rbw add` creates login items only (SSH keys go through bw-autotype).
 - Signing in with a passkey needs two confirmations: the list, then the key.
+- If `base_url` is set in your rbw config (the EU cloud, a self-hosted server), `rbw list` without `--raw`, `rbw sync` and `bwv add` print `bwv-pull: base_url を設定した環境は未対応です` and do not refresh your side's copy of the database: rbw names the copy after the server, and `bwv-pull` only writes the `default` one. `rbw list --raw`, `bwv get`, `bwv code`, SSH and passkeys go straight to the gate and do not use that copy, but this setup has not been tested.
 - The gate talks to Bitwarden's API directly (to create items and list passkeys).
 - During the list approval window, every process of your user can see the list of names. A shorter window means more confirmations.
 - It cannot stop a fake authentication dialog from getting you to type your password (as long as the fingerprint works, there is nothing to type).
