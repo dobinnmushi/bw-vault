@@ -12,6 +12,8 @@
   標準の rbw get は、探す段階で全項目のノートを復号するので、項目ごとの確認と両立しない。
 - List（門独自）: 一覧（rbw list --raw と同じ形）を1回の要求で返す。復号した一覧は、保管庫が変わる（DB が変わる・Lock）まで門の中で覚える。
   確認は list（Decrypt と同じ窓）。一覧を、項目ごとの復号の往復（数百回）でやらずに済ませるため。
+- GetEntry（門独自）に "public": true を付けると、秘密を除いた欄（名前・フォルダ・ユーザー名・URI・SSH の公開鍵と指紋）だけを、
+  同じ形で返す（ほかの欄は null か空）。これらは一覧の確認で、すでに見える欄なので、確認は list だけ（項目の確認は出ない）。
 - GetEntry（門独自）: 項目の ID を指定して、その項目の全欄を復号して返す（rbw get --raw と同じ形）。
   polkit の確認は「親プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。親が分からなければ、要求元のプロセスごと。
   同じ親の子が同じ項目をもう一度頼むときだけ（rofi-rbw は rbw get と rbw code を別のプロセスで続けて起動する）、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
@@ -335,7 +337,9 @@ IDENTITY_KEYS = ("title", "first_name", "middle_name", "last_name", "address1", 
 SSHKEY_KEYS = ("public_key", "fingerprint", "private_key")
 
 
-def decrypt_entry(entry):
+def decrypt_entry(entry, public=False):
+    """項目の全欄を復号する。public=True なら、「一覧の確認」で、すでに見える欄だけを復号し、秘密は空にする
+    （名前・フォルダ・Login のユーザー名と URI・SSH 鍵の公開鍵と指紋。形は同じで、ほかは null か空）"""
     key, org = entry.get("key"), entry.get("org_id")
 
     def dec(cs, local=False):
@@ -353,17 +357,20 @@ def decrypt_entry(entry):
         except Exception:
             return None
 
+    def pick(d, keys, shown):       # shown の欄だけ復号し、ほかは null（public のとき）。通常は全部復号する
+        return {k: (dec_soft(d.get(k)) if (not public or k in shown) else None) for k in keys}
+
     data = entry.get("data")
     if isinstance(data, dict) and "Login" in data:
         d = data["Login"]
-        out = {k: dec_soft(d.get(k)) for k in LOGIN_KEYS}
+        out = pick(d, LOGIN_KEYS, ("username",))
         out["uris"] = [{"uri": dec_soft(u["uri"]), "match_type": u.get("match_type")} for u in d.get("uris") or []]
     elif isinstance(data, dict) and "Card" in data:
-        out = {k: dec_soft(data["Card"].get(k)) for k in CARD_KEYS}
+        out = pick(data["Card"], CARD_KEYS, ())
     elif isinstance(data, dict) and "Identity" in data:
-        out = {k: dec_soft(data["Identity"].get(k)) for k in IDENTITY_KEYS}
+        out = pick(data["Identity"], IDENTITY_KEYS, ())
     elif isinstance(data, dict) and "SshKey" in data:
-        out = {k: dec_soft(data["SshKey"].get(k)) for k in SSHKEY_KEYS}
+        out = pick(data["SshKey"], SSHKEY_KEYS, ("public_key", "fingerprint"))    # 公開鍵は、SSH エージェントが確認なしで返すので、秘密ではない
     else:
         out = None          # SecureNote（rbw の出力でも null）
     return {
@@ -371,11 +378,11 @@ def decrypt_entry(entry):
         "folder": dec(entry["folder"], local=True) if entry.get("folder") else None,
         "name": dec(entry["name"]),
         "data": out,
-        "fields": [{"name": dec(f.get("name")), "value": dec(f.get("value")),
-                    "type": FIELD_TYPES.get(f.get("ty"))} for f in entry.get("fields") or []],
-        "notes": dec_soft(entry.get("notes")),
-        "history": [{"last_used_date": h["last_used_date"], "password": dec(h["password"])}
-                    for h in entry.get("history") or []],
+        "fields": [] if public else [{"name": dec(f.get("name")), "value": dec(f.get("value")),
+                                      "type": FIELD_TYPES.get(f.get("ty"))} for f in entry.get("fields") or []],
+        "notes": None if public else dec_soft(entry.get("notes")),
+        "history": [] if public else [{"last_used_date": h["last_used_date"], "password": dec(h["password"])}
+                                      for h in entry.get("history") or []],
     }
 
 
@@ -752,6 +759,16 @@ def handle_request(pid, action):
         entry = INDEX.by_id.get(action.get("id"))
         if entry is None:
             return error("no such entry")
+        if action.get("public") is True:
+            # 秘密を除いた欄だけ（ユーザー名・URI・名前・フォルダ・SSH の公開鍵と指紋）。これらは「一覧の確認」で、すでに見える欄なので、
+            # 項目の確認（secret）は要らず、一覧の確認（list）だけ。「ユーザー名だけを入力する」操作で、2回目の確認を出さないため
+            if not authorize_list(pid):
+                return error("authorization denied")
+            try:
+                return {"type": "Entry", "entry": decrypt_entry(entry, public=True)}
+            except (RuntimeError, OSError) as e:
+                log(f"項目（公開の欄）の復号に失敗: {type(e).__name__}: {e}")
+                return error(f"could not decrypt the entry: {e}")
         # 承認は「親プロセス＋項目」。rofi-rbw は、1回の操作で rbw get と rbw code（TOTP）を、別のプロセスで続けて起動するので、
         # 同じ親の子が同じ項目を頼むときは、聞き直さない。別の項目は必ず聞き直す。親が分からないときは、プロセスごと
         if not authorize(pid, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=parent_of(pid)):

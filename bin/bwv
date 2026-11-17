@@ -2,7 +2,8 @@
 """bwv: bwvault の門から項目の秘密を取り出す。`rbw get` の代わり（vault プロファイル用）。
 
   bwv list --raw                                       項目の一覧（rbw list --raw と同じ形の JSON。門が1回の要求で返す）
-  bwv get [--raw] [-i] [--folder F] 名前または UUID [ユーザー名]
+  bwv get [--raw] [--public] [-i] [--folder F] 名前または UUID [ユーザー名]
+                                                       --public: 秘密を除いた欄だけ（ユーザー名・URI など）。一覧の確認だけで返り、項目の確認は出ない
   bwv code [-i] [--folder F] 名前または UUID [ユーザー名]   TOTP のコード（rofi-rbw が rbw code で呼ぶ）
   bwv add [--uri U] [--folder F] 名前 [ユーザー名]    標準入力の1行目がパスワード、残りがノート（rbw add と同じ）
   bwv add --ssh [--folder F] 名前                      標準入力は JSON {"private_key","public_key","fingerprint"}
@@ -115,8 +116,12 @@ def find_entry(entries, needle, user, folder, ignore_case):
         for e in found))
 
 
-def get_entry(entry_id):
-    res = gate_call({"type": "GetEntry", "id": entry_id})
+def get_entry(entry_id, public=False):
+    """public=True なら、秘密を除いた欄だけを頼む（一覧の確認だけで返る）。古い gate は public を知らず、全欄を返す（項目の確認つき）"""
+    action = {"type": "GetEntry", "id": entry_id}
+    if public:
+        action["public"] = True
+    res = gate_call(action)
     if res.get("type") != "Entry":
         die(res.get("error", str(res)))
     return res["entry"]
@@ -196,6 +201,7 @@ def main():
     g.add_argument("user", nargs="?")
     g.add_argument("--folder")
     g.add_argument("--raw", action="store_true")
+    g.add_argument("--public", action="store_true")
     g.add_argument("-i", "--ignore-case", action="store_true")
     c = sub.add_parser("code")
     c.add_argument("needle")
@@ -223,7 +229,7 @@ def main():
     except ValueError:
         needle = ("name", a.needle)
     e = find_entry(list_entries(), needle, a.user, a.folder, a.ignore_case)
-    entry = get_entry(e["id"])
+    entry = get_entry(e["id"], public=getattr(a, "public", False))
     if a.cmd == "code":
         secret = (entry.get("data") or {}).get("totp")
         if not secret:

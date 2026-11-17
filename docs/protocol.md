@@ -33,6 +33,7 @@
 | `List` | – | `List`（`entries`） | **`list`** | 一覧を**1回の要求**で返す。`rbw list --raw` と同じ形（`id` `name` `user` `folder` `uris` `type`。名前順）。門が復号して、保管庫が変わる（DB の更新・`Lock`）まで覚えているので、2回目以降は速い（483 件で、項目ごとの復号を往復する約 0.6 秒が、ほぼ 0 になる） |
 | `Decrypt` | `cipherstring`, `entry_key`, `org_id` | `Decrypt`（`plaintext`） | **`list`** | **項目名・ユーザー名・URI・フォルダ名の暗号文だけ**。秘密の欄は `Error`（`secret fields are only available through GetEntry`）。未知の暗号文も同じ |
 | `GetEntry` | `id` | `Entry`（`entry`） | **`secret`**（項目ごと） | `rbw get --raw` と同じ形（下記） |
+| `GetEntry` + `"public": true` | `id`、`public` | `Entry`（`entry`） | **`list`**（項目の確認は出ない） | **秘密を除いた欄だけ**（下記）。「ユーザー名だけを入力する」操作で、2回目の確認を出さないため。`public` は真偽値の `true` のときだけ有効（文字列などは、通常の `GetEntry`）。古い gate は `public` を知らず、全欄を返す（項目の確認つき） |
 | `PasskeyList` | `force`（任意） | `Passkeys`（`passkeys`） | **`list`** | 秘密鍵は **含まれない**。gate が 10 分覚えている。`force` は、10 秒より古ければ取り直す |
 | `PasskeyGet` | `ref` | `Passkey` | **`secret`**（パスキーごと） | 秘密鍵（暗号化を外した文字列）を返す |
 | `AddEntry` | `kind` と、その種類の欄 | `Ack` | **`write`** | 暗号化と Bitwarden への送信は gate が行う（下記） |
@@ -47,6 +48,9 @@
 ```
 `data` は項目の種類で決まる。Login: `username` `password` `totp` `uris`（`[{"uri", "match_type"}]`）、Card: `cardholder_name` `number` `brand` `exp_month` `exp_year` `code`、
 Identity: 17 の欄（`title` … `username`）、SshKey: `public_key` `fingerprint` `private_key`、SecureNote: `null`。
+
+**`public: true` のとき**は、形は同じで、**一覧の確認ですでに見える欄だけ**が入る: `id`、`name`、`folder`、Login の `username` と `uris`、SshKey の `public_key` と `fingerprint`
+（SSH の公開鍵は、SSH エージェントが確認なしで返す）。そのほか（`password`・`totp`・Card と Identity の欄・`private_key`）は `null`、`fields` と `history` は `[]`、`notes` は `null`。
 
 ### `Passkeys` の1件
 

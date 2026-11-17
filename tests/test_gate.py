@@ -339,6 +339,40 @@ ask_child({"type": "GetEntry", "id": "e1"})
 check("親が分からないときは、プロセスごとに聞く（引き継がない）", len(asked(SECRET)) == 2)
 gate.parent_of = orig_parent
 
+# ===== GetEntry public（秘密を除いた欄だけ。一覧の確認だけで返り、項目の確認は出ない）=====
+approve()
+n = len(calls)
+r = ask({"type": "GetEntry", "id": "e1", "public": True})
+e = r.get("entry", {})
+check("public は一覧の確認（list）だけで返り、項目の確認（secret）は出ない", r.get("type") == "Entry" and [a for a, _ in polk] == [LIST])
+check("public: Login は名前・フォルダ・ユーザー名・URI だけ。パスワード・TOTP・フィールド・ノート・履歴は空",
+      e.get("data") == {"username": "PT:2.user|a|b", "password": None, "totp": None, "uris": [{"uri": "PT:2.uri|a|b", "match_type": None}]}
+      and e.get("name") == "PT:2.name|a|b" and e.get("folder") == "PT:2.folder|a|b"
+      and e.get("fields") == [] and e.get("notes") is None and e.get("history") == [])
+check("public: 秘密の暗号文を agent に復号させていない（名前・フォルダ・ユーザー名・URI だけ）",
+      all(c in ("2.name|a|b", "2.user|a|b", "2.uri|a|b", "2.folder|a|b") for c in dcalls(n)))
+check("public: 形は、通常の GetEntry と同じキー（rofi-rbw が同じ読み方で読める）", list(e.keys()) == ["id", "folder", "name", "data", "fields", "notes", "history"])
+n = len(calls)
+r3 = ask({"type": "GetEntry", "id": "e3", "public": True})["entry"]
+check("public: SSH 鍵は公開鍵と指紋だけ。秘密鍵は null で、復号もしない",
+      r3["data"] == {"public_key": PUB, "fingerprint": "PT:2.sshfp|a|b", "private_key": None} and "2.sshpriv|a|b" not in dcalls(n))
+r2 = ask({"type": "GetEntry", "id": "e2", "public": True})["entry"]
+check("public: SecureNote は data も notes も null", r2["data"] is None and r2["notes"] is None and r2["name"] == "PT:2.name2|a|b")
+approve()
+ask({"type": "GetEntry", "id": "e1", "public": True})
+check("public のあとでも、通常の GetEntry（秘密）は項目の確認が出る（public の承認は、秘密に使えない）",
+      ask({"type": "GetEntry", "id": "e1"}).get("type") == "Entry" and len(asked(SECRET)) == 1)
+approve()
+r = ask({"type": "GetEntry", "id": "e1", "public": "true"})
+check("public は、真偽値 true のときだけ。文字列などは、通常の GetEntry として項目の確認を求める（取り違えを防ぐ）",
+      r.get("type") == "Entry" and r["entry"]["data"]["password"] == "PT:2.pass|a|b" and len(asked(SECRET)) == 1)
+approve(False)
+n = len(calls)
+r = ask({"type": "GetEntry", "id": "e1", "public": True})
+check("public でも、一覧の確認が通らなければ断られ、何も復号されない", r.get("type") == "Error" and dcalls(n) == [])
+approve()
+check("public で存在しない ID は断る", ask({"type": "GetEntry", "id": "nope", "public": True}).get("type") == "Error")
+
 # ===== 自動解錠 =====
 approve()
 STATE["locked"] = True

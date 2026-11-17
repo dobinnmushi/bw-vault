@@ -72,6 +72,7 @@ open(W + "/real-rbw", "w").write('#!/bin/sh\necho "$@" >> %s/real.log\necho \'[{
 os.chmod(W + "/real-rbw", 0o755)
 GATE_MODE = {"list": True}
 seen_actions = []
+full_actions = []
 ENTRIES = [{"id": "1", "name": "a", "user": "u", "folder": None, "uris": ["https://a.example"], "type": "Login"}]
 
 
@@ -79,8 +80,13 @@ class FakeGate(socketserver.StreamRequestHandler):
     def handle(self):
         a = json.loads(self.rfile.readline())["action"]
         seen_actions.append(a["type"])
+        full_actions.append(a)
         if a["type"] == "List" and GATE_MODE["list"]:
             r = {"type": "List", "entries": ENTRIES}
+        elif a["type"] == "GetEntry":
+            r = {"type": "Entry", "entry": {"id": a["id"], "folder": None, "name": "a",
+                                            "data": {"username": "u", "password": None if a.get("public") else "pw", "totp": None, "uris": []},
+                                            "fields": [], "notes": None, "history": []}}
         else:
             r = {"type": "Error", "error": f"{a['type']} is not allowed"}
         self.wfile.write(json.dumps(r).encode() + b"\n")
@@ -116,6 +122,21 @@ t("古い gate（List を知らない）: 従来の経路に戻り、固まら�
 if code != 0: print("      stderr:", err[-400:].replace("\n", " | "))
 t("古い gate: 実体の rbw は、ちょうど1回だけ呼ばれる", open(W + "/real.log").read().count("list --raw"), 1)
 t("古い gate: 門への List の問い合わせは、1回だけ", seen_actions.count("List"), 1)
+
+# --- get --public（秘密を除いた欄だけ。rofi-rbw が、ユーザー名だけを入力するときに付ける）
+GATE_MODE["list"] = True
+full_actions.clear()
+code, out, err = run_rbw("get", "--raw", "--public", "a")
+get_actions = [x for x in full_actions if x["type"] == "GetEntry"]
+t("rbw get --raw --public は、ラッパーから bwv に渡り、gate の GetEntry に public: true を付ける",
+  (code, len(get_actions), get_actions[0].get("public") if get_actions else None, json.loads(out)["data"]["password"] if code == 0 else "?"),
+  (0, 1, True, None))
+full_actions.clear()
+code, out, err = run_rbw("get", "--raw", "a")
+get_actions = [x for x in full_actions if x["type"] == "GetEntry"]
+t("--public がなければ、public は付けない（従来どおり、全欄＋項目の確認）",
+  (code, len(get_actions), "public" in get_actions[0] if get_actions else None, json.loads(out)["data"]["password"] if code == 0 else "?"),
+  (0, 1, False, "pw"))
 shutil.rmtree(W, ignore_errors=True)
 print("結果:", "全部OK" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
