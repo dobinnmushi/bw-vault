@@ -81,7 +81,7 @@ your user                                       bwvault (dedicated user, system 
 |---|---|---|---|
 | `…bwvault.list` | The list of item names etc., the list of passkeys, an item without its secrets (username and URIs only: typing or copying just the username) | The requester | **All of your user**, 20 seconds (separate processes fetch the list during one action) |
 | `…bwvault.secret` | Fetching an item, a passkey's private key | The **item name** (for a passkey, the site and username) and the requester | Items: **parent process + item** (rofi-rbw starts `rbw get` and `rbw code` (TOTP) as separate processes one after another); passkeys: **process + passkey**; 10 seconds. A different item always asks again |
-| `…bwvault.write` | Creating an item or a passkey | The kind and name of the new entry, and the requester | Process + name, 10 seconds |
+| `…bwvault.write` | Creating an item or a passkey | The kind and name of the new entry (for a passkey, the site it will be bound to: `rpId`), and the requester | Process + name, 10 seconds |
 | `…bwvault.ssh-sign` | An SSH signature | The key's item name and the username being logged in as | **Parent process + key**, 30 seconds (`git push` may start ssh several times; they are children of the same git) |
 
 Approvals bound to the parent process fall back to per-process when the parent is systemd (the user service manager) or pid 1; their children never share one.

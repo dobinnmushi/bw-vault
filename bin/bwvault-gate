@@ -844,7 +844,8 @@ def handle_request(peer, action):
             return error(f"could not decrypt the passkey: {e}")
     if kind == "AddEntry" and action.get("kind") == "passkey":
         cred = action.get("credential")
-        label = (cred.get("rpName") or cred.get("rpId") or "") if isinstance(cred, dict) else ""
+        # 確認画面に出すのは、実際に結び付くサイト（rpId）。rpName は呼び出し元が好きに書ける名前なので出さない
+        label = cred.get("rpId") if isinstance(cred, dict) and isinstance(cred.get("rpId"), str) else ""
         if not authorize(peer, "passkey:" + str(label), ACTION_WRITE, lambda: f"新規登録（パスキー）: {label}"):
             return error("authorization denied")
         try:

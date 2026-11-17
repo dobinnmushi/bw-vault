@@ -543,7 +543,11 @@ cred_new = {"credentialId": "b64.AQID", "keyType": "public-key", "keyAlgorithm":
 n_get = len([x for x in api_log if x[:2] == ("GET", "/api/sync")])
 r = ask({"type": "AddEntry", "kind": "passkey", "name": "Example", "credential": cred_new})
 fc = [x for x in api_log if x[1] == "/api/ciphers"][-1][2]
-check("AddEntry(passkey) は write の確認が出る", r.get("type") == "Ack" and asked(WRITE) == [(WRITE, "新規登録（パスキー）: Example")])
+check("AddEntry(passkey) は write の確認が出る", r.get("type") == "Ack" and asked(WRITE) == [(WRITE, "新規登録（パスキー）: example.com")])
+approve()
+r = ask({"type": "AddEntry", "kind": "passkey", "name": "My Bank", "credential": dict(cred_new, rpId="evil.example", rpName="My Bank")})
+check("確認画面には、呼び出し元が名乗る名前（rpName）ではなく、結び付くサイト（rpId）が出る",
+      r.get("type") == "Ack" and asked(WRITE) == [(WRITE, "新規登録（パスキー）: evil.example")])
 check("全欄が暗号化されて送られる（秘密鍵の平文は API に出ない）",
       fc["login"]["fido2Credentials"][0]["keyValue"] == "ENC(DERKEY)" and fc["login"]["fido2Credentials"][0]["userDisplayName"] is None
       and "DERKEY" not in json.dumps(fc).replace("ENC(DERKEY)", "") and fc["login"]["fido2Credentials"][0]["creationDate"].endswith("Z")
