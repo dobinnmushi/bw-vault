@@ -20,7 +20,7 @@
 
 ## 要求
 
-承認の種類（`list`・`secret`・`write`・`ssh-sign`）と窓は、README の「確認の一覧」を参照。
+承認の種類（`list`・`secret`・`write`・`ssh-sign`）と窓は、README の「確認の一覧」（英語版は "Confirmations"）を参照。
 
 | `type` | 引数 | 応答 | 確認 | 備考 |
 |---|---|---|---|---|

@@ -1,167 +1,186 @@
 # bw-vault
 
-Bitwarden（[rbw](https://github.com/doy/rbw)）の保管庫の鍵を、**自分のユーザーとは別のユーザー `bwvault`** に置き、
-秘密を出す前に **polkit（sudo と同じ認証：指紋、だめならパスワード）で本人確認**をする仕組みです。
+[日本語](README.ja.md)
 
-## 3つの部品
+Keeps the key to your Bitwarden vault ([rbw](https://github.com/doy/rbw)) under a **separate user, `bwvault`**, and asks
+**polkit — your fingerprint, then your password, like `sudo` —** before any secret leaves it.
 
-Bitwarden を Linux のデスクトップ（GNOME / Wayland）で、パスワードの入力・パスキー・SSH まで使えるようにする、3つのリポジトリの1つです。
-bw-vault は、その**認証の部分**で、残りの2つは、それぞれ単独でも動きます。
+## Status
 
-| リポジトリ | 役割 | bw-vault がないとき |
+**Experimental.** It was built and checked in the following setup only; nothing else has been tried.
+
+- Ubuntu 26.04 (GNOME 50 / Wayland), one laptop with a fingerprint reader and a TPM2, **one user**.
+- It installs things as root (`/etc/pam.d/polkit-1`, system services, a dedicated user). Read what it installs; the installer
+  shows a diff and asks before it changes anything.
+- It passes its automated tests (`tests/run.sh`) and an automated security review of the changes. **It has not been audited by
+  an independent third party.**
+- No compatibility promise yet (`docs/protocol.md` included).
+
+## Three parts
+
+One of three repositories that let you use Bitwarden on a Linux desktop (GNOME / Wayland) for typing passwords, passkeys and SSH.
+bw-vault is the **authentication part**; the other two also work on their own.
+
+| Repository | What it does | Without bw-vault |
 |---|---|---|
-| **bw-vault**（これ） | 保管庫の鍵を別ユーザーに置き、秘密を出す前に polkit で確認する門。SSH エージェントも兼ねる | – |
-| [bw-autotype](https://github.com/dobinnmushi/bw-autotype) | ホットキーで、ユーザー名・パスワード・TOTP を任意のアプリに入力。新規登録 | 単独で動く（自前で指紋を確認） |
-| [bw-passkey](https://github.com/dobinnmushi/bw-passkey) | 保管庫のパスキーを使う、仮想の FIDO2 セキュリティキー | 単独で動く（自前で指紋を確認） |
+| **bw-vault** (this) | Keeps the vault key under another user and asks polkit before any secret leaves it. Also an SSH agent | – |
+| [bw-autotype](https://github.com/dobinnmushi/bw-autotype) | Types usernames, passwords and TOTP codes into any app with a hotkey; creates new logins | Works alone (checks your fingerprint itself) |
+| [bw-passkey](https://github.com/dobinnmushi/bw-passkey) | A virtual FIDO2 security key that uses the passkeys in your vault | Works alone (checks your fingerprint itself) |
 
-一緒に使うと、入力・パスキー・SSH の**すべてが、同じ門と、同じ確認**（指紋、だめならパスワード）を通ります。
-bw-autotype と bw-passkey は、bw-vault のソケットがあれば自動で門を使い、なければ従来のまま動きます。
-導入は、bw-vault（下の「導入」）→ bw-autotype・bw-passkey（それぞれの README）の順です。
-門との約束事は [`docs/protocol.md`](docs/protocol.md) に書いてあり、別のクライアントも作れます。
+Used together, typing, passkeys and SSH **all go through the same gate and the same confirmation** (fingerprint, then password).
+bw-autotype and bw-passkey use the gate automatically when its socket exists, and behave as before when it does not.
+Install bw-vault first (see "Install"), then bw-autotype and bw-passkey (see their READMEs).
+The protocol with the gate is in [`docs/protocol.md`](docs/protocol.md) (Japanese), so other clients can be written.
 
-## なぜ要るか
+## Why
 
-rbw-agent は、解錠すると保管庫の鍵をメモリに持ち、**同じユーザーで動くどのプログラムの「復号して」にも応えます**。
-ホットキーの指紋確認（bw-autotype）は入口の画面を守るだけで、別のプログラムが直接 `rbw get` を呼ぶことは止められません。
-Linux には、同じユーザーの中でプログラムを区別する権限の境界がないので（ファイルの権限・ソケットの権限・プログラム内の確認は、
-同じユーザーなら迂回できます）、鍵と復号の能力を**別のユーザー**に移し、そこが認証を要求する形にしました。
+Once unlocked, rbw-agent keeps the vault key in memory and **answers "decrypt this" for any program running as your user**.
+The fingerprint check on a hotkey (bw-autotype) only guards that screen; another program can still run `rbw get`.
+Linux has no permission boundary between programs of the same user (file modes, socket modes and checks inside a program can all be
+bypassed by the same user), so the key and the ability to decrypt are moved to **another user**, which demands authentication.
 
-## 守るもの・守らないもの
+## What it protects, and what it does not
 
-**守る**（同じユーザーで動く、認証を通していないプログラムから）:
-- 項目の秘密：パスワード・TOTP・ノート・カード・SSH 秘密鍵・隠しフィールド・履歴・パスキーの秘密鍵
-- 項目名・ユーザー名・URL・フォルダ名・パスキーのサイト名の一覧
-- 保管庫の暗号化された鍵・アクセストークン（持ち出してのマスターパスワードの総当たりを防ぐ）
-- 復号・暗号化・停止を頼める agent のソケット
+**Protects** (from programs running as your user that have not passed a confirmation):
+- Item secrets: passwords, TOTP, notes, cards, SSH private keys, hidden fields, history, passkey private keys
+- The list of item names, usernames, URLs, folder names and passkey sites
+- The encrypted vault key and access token (so the master password cannot be brute-forced offline from a copy)
+- The agent socket, which could decrypt, encrypt and stop the agent on request
 
-**守らない**:
-- root と、sudo を使える人。カーネルの脆弱性。物理的な攻撃（封印したマスターパスワードは、root なら `systemd-creds decrypt` で復号できます）
-- 承認した瞬間に、平文が呼び出し元（入力するプログラム）へ渡ること。キーロガー
-- 確認の画面を、あなたが何も考えずに通すこと（画面には、**どの項目か**と**要求元のプログラム**が出ます。見て判断する前提です）。
-  導入・更新の `yes` も同じで、差分を読んで、心当たりのない変更がないことを確かめてから入力してください
-- 一覧の承認の窓（既定 20 秒）の間は、同じユーザーの全プロセスが、名前の一覧を見られます（秘密は出ません）
+**Does not protect:**
+- root and anyone who can use `sudo`; kernel vulnerabilities; physical attacks (the sealed master password can be decrypted by root with `systemd-creds decrypt`)
+- The moment you approve: the plaintext goes to the caller (the typing program). Keyloggers.
+- You approving a prompt without thinking (the dialog shows **which item** and **which program** asks; you are expected to look).
+  The same goes for the `yes` of the installer: read the diff and confirm there is nothing you do not recognize before you type it
+- During the list approval window (20 seconds by default), every process of your user can see the list of names (not secrets)
 
-## 仕組み
+## How it works
 
 ```
-あなたのユーザー側                              bwvault（専用ユーザー、system サービス）
- rbw（ラッパー） rofi-rbw bw-autotype bwv ─┐      ┌ bwvault-gate ── polkit で確認 ──→ あなたの画面（指紋）
- bw-passkey  ssh / git ───────────────────┴─ソケット→│   ├ 一覧：確認（list）を通して返す
-                                                      │   ├ 秘密：項目ごとに確認（secret）を通して返す
-                                                      │   ├ 書き込み：確認（write）を通して暗号化・送信
-                                                      │   └ SSH 署名：確認（ssh-sign）を通して agent へ
-                                                      └ rbw-agent（無改造）── 保管庫の鍵・トークン・DB
+your user                                       bwvault (dedicated user, system services)
+ rbw (wrapper) rofi-rbw bw-autotype bwv ──┐      ┌ bwvault-gate ── asks polkit ──→ your screen (fingerprint)
+ bw-passkey  ssh / git ───────────────────┴socket→│   ├ list: returned after a confirmation (list)
+                                                   │   ├ secrets: per item, after a confirmation (secret)
+                                                   │   ├ writes: encrypted and sent after a confirmation (write)
+                                                   │   └ SSH signatures: passed to the agent after a confirmation (ssh-sign)
+                                                   └ rbw-agent (unmodified) ── vault key, token, database
 ```
 
-- **bwvault-agent**：公式の rbw-agent を、専用ユーザーで動かします（`ProtectHome`・`ProtectProc`・`CapabilityBoundingSet=` など。
-  `systemd-analyze security` で 3.1）。バイナリは root 所有の `/usr/local/lib/bwvault/` に置きます。
-- **bwvault-gate**：あなたのユーザーが使える唯一の入口（`/run/bwvault-gate/`）。rbw と同じ JSON 行のプロトコルを話し、
-  要求ごとに許可を決めます（3.3）。接続相手の pid と uid は、kernel が教える `SO_PEERCRED` で得ます。
-- **自動解錠**：マスターパスワードを `systemd-creds`（TPM2 とホスト鍵）で封印し、使われたとき gate が agent を解錠させます。
-  `lock_timeout` は 300 秒（使われなければ施錠）。解錠自体は秘密を出さないので、本人確認は要りません。
-- **ユーザー側**：`rbw` のラッパー（`shim/rbw`）が、`get`・`code`・`add` を `bwv` に差し替え、`list`・`sync` の前後に、
-  トークンと鍵を除いた暗号化された写し（`~/.cache/rbw-vault/`）を取り直します。プロファイルは `RBW_PROFILE=vault`。
+- **bwvault-agent**: the stock rbw-agent, run as a dedicated user (`ProtectHome`, `ProtectProc`, `CapabilityBoundingSet=` and more;
+  3.1 in `systemd-analyze security`). The binaries live in the root-owned `/usr/local/lib/bwvault/`.
+- **bwvault-gate**: the only entrance your user can use (`/run/bwvault-gate/`). It speaks rbw's JSON-lines protocol and decides per request
+  (3.3). The peer's pid and uid come from `SO_PEERCRED`, which the kernel provides.
+- **Automatic unlock**: the master password is sealed with `systemd-creds` (TPM2 and the host key), and the gate has the agent unlock when it is used.
+  `lock_timeout` is 300 seconds (it locks when unused). Unlocking itself reveals nothing, so it needs no confirmation.
+- **Your side**: the `rbw` wrapper (`shim/rbw`) replaces `get`, `code` and `add` with `bwv`, and around `list` and `sync` it refreshes an encrypted copy of the
+  items without the token and keys (`~/.cache/rbw-vault/`). The profile is `RBW_PROFILE=vault`.
 
-### 確認の一覧
+### Confirmations
 
-| polkit アクション | いつ | 画面に出るもの | 承認の結び付け先と時間 |
+| polkit action | When | What the dialog shows | What the approval is bound to, and for how long |
 |---|---|---|---|
-| `…bwvault.list` | 項目名などの一覧、パスキーの一覧 | 要求元 | **ユーザー全体**で 20 秒（1回の操作で、別々のプロセスが一覧を取るため） |
-| `…bwvault.secret` | 項目の取り出し、パスキーの秘密鍵 | **項目名**（パスキーはサイト名とユーザー名）、要求元 | 項目は**親プロセス＋項目**（rofi-rbw は `rbw get` と `rbw code`（TOTP）を別のプロセスで続けて起動するため）、パスキーは**プロセス＋パスキー**ごとに 10 秒。別の項目は必ず聞き直す |
-| `…bwvault.write` | 項目・パスキーの新規作成 | 新規登録の種類と名前、要求元 | プロセス＋名前ごとに 10 秒 |
-| `…bwvault.ssh-sign` | SSH 署名 | 鍵の項目名と、入ろうとしているユーザー名 | **親プロセス＋鍵**ごとに 30 秒（`git push` が ssh を何度か起動しても、同じ git の子なら聞き直さない） |
+| `…bwvault.list` | The list of item names etc., the list of passkeys | The requester | **All of your user**, 20 seconds (separate processes fetch the list during one action) |
+| `…bwvault.secret` | Fetching an item, a passkey's private key | The **item name** (for a passkey, the site and username) and the requester | Items: **parent process + item** (rofi-rbw starts `rbw get` and `rbw code` (TOTP) as separate processes one after another); passkeys: **process + passkey**; 10 seconds. A different item always asks again |
+| `…bwvault.write` | Creating an item or a passkey | The kind and name of the new entry, and the requester | Process + name, 10 seconds |
+| `…bwvault.ssh-sign` | An SSH signature | The key's item name and the username being logged in as | **Parent process + key**, 30 seconds (`git push` may start ssh several times; they are children of the same git) |
 
-指紋は 5 回まで試せ、だめならパスワードです（`pam/polkit-1`。sudo・ログインの設定は変えません）。
-承認を「項目」に結び付けているのは意図的です。ダイアログの項目名を見て、別の項目を狙う要求を見破れるようにするためです。
+You get 5 fingerprint attempts, then the password (`pam/polkit-1`; sudo and login are not changed).
+Binding approvals to an item is deliberate: the item name in the dialog lets you spot a request aimed at a different item.
 
-## 導入
+## Install
 
-必要なもの：rbw 1.15.0（`~/.local/bin/rbw` と `rbw-agent`。ELF の実行ファイル）、polkit と fprintd（指紋）、TPM2 と、`systemd-creds`・`LoadCredentialEncrypted=` が使える systemd（動作確認は 259）、
-`python3-gi`、`pinentry-curses`。
+Requirements: rbw 1.15.0 (`~/.local/bin/rbw` and `rbw-agent`, ELF binaries), polkit and fprintd (fingerprint), TPM2 and a systemd with `systemd-creds` and
+`LoadCredentialEncrypted=` (tested with 259), `python3-gi`, `pinentry-curses`.
 
 ```sh
-bash install/setup-bwvault.sh --check  # 何が入るかを見る（root 不要）
-sudo bash install/setup-bwvault.sh     # bwvault ユーザー・サービス・polkit の定義を入れる。差分を表示して、yes の入力を求める
-sudo bwvault-admin login               # bwvault 側で Bitwarden にログイン（マスターパスワード、2段階認証）
+bash install/setup-bwvault.sh --check  # see what would be installed (no root)
+sudo bash install/setup-bwvault.sh     # installs the bwvault user, services and polkit definitions; shows a diff and asks for yes
+sudo bwvault-admin login               # log in to Bitwarden on the bwvault side (master password, two-step login)
 sudo bwvault-admin sync
-sudo bwvault-admin seal-master         # マスターパスワードを TPM2 で封印 → 以降は自動で解錠される
-install/install-user.sh                # ユーザー側：rbw のラッパー・bwv・SSH_AUTH_SOCK（sudo 不要）。ログインし直す
+sudo bwvault-admin seal-master         # seal the master password with the TPM2 → from now on it unlocks automatically
+install/install-user.sh                # your side: the rbw wrapper, bwv, SSH_AUTH_SOCK (no sudo). Log in again afterwards
 ```
 
-bw-autotype を使うなら、`~/.config/bw-autotype/config.toml` の `[auth] method = "none"`（確認は gate が行うので、二重にしない）。
-bw-passkey は、gate のソケットがあれば自動で gate を使います。
+If you use bw-autotype, set `[auth] method = "none"` in `~/.config/bw-autotype/config.toml` (the gate confirms for you; do not ask twice).
+bw-passkey uses the gate automatically when its socket exists.
 
-### 導入スクリプトの安全確認
+### Safety checks in the installer
 
-`setup-bwvault.sh` は、root で、あなたのフォルダにあるファイルを、システムの大事な場所（`/etc/pam.d/polkit-1` を含む）へコピーします。
-悪意のあるプログラムが、先にそのフォルダを書き換えていても気づけるように、次のようにしています。
+`setup-bwvault.sh` copies files from your folder (which your user can modify) into sensitive system locations (including `/etc/pam.d/polkit-1`) as root.
+So that you notice if a malicious program modified that folder beforehand:
 
-- 入れるファイルを、**root 所有の一時置き場に先に写し**、その写しを表示し、その写しだけを入れる（表示と実際の内容がすり替わらない）。
-- システムの版との**差分**（新規なら SHA-256）を表示し、`yes` と入力しない限り、何も入れない。
-- `/etc/pam.d/polkit-1` が変わるときは、**別の確認**を、必ず対話で求める（`--yes` でも省けない。端末がなければ中止）。
-- rbw の実行ファイルは、控えてあるハッシュと照合する（違えば、確認する）。
-- 試験：`tests/test_setup.py`（改ざんが差分に出ること、確認を省けないこと）。
+- It first **copies the files to a root-owned temporary directory**, shows that copy, and installs only that copy (what you see is what gets installed).
+- It shows the **diff** against the installed version (a SHA-256 for new files) and installs nothing unless you type `yes`.
+- If `/etc/pam.d/polkit-1` changes, it asks a **separate question** interactively (`--yes` does not skip it; without a terminal it aborts).
+- The rbw binaries are checked against recorded hashes (it asks if they differ).
+- Tests: `tests/test_setup.py` (tampering shows up in the diff; the confirmations cannot be skipped).
 
-## 日常
+## Daily use
 
-| 操作 | コマンド |
+| To | Run |
 |---|---|
-| 状態 | `systemctl status bwvault-agent bwvault-gate`、`journalctl -u bwvault-gate`（記録に項目名は残らず、短い識別子 `[a1b2c3d4]` だけ） |
-| 手で施錠・解錠・同期 | `sudo bwvault-admin lock` / `unlock` / `sync` |
-| マスターパスワードを変えた | `sudo bwvault-admin seal-master` をやり直す |
-| 確認の窓の長さを変える | `/etc/bwvault/gate.env` に `BWVAULT_LIST_SECONDS` `BWVAULT_GROUP_SECONDS` `BWVAULT_SSH_GROUP_SECONDS` を書き、`sudo systemctl restart bwvault-gate` |
-| 一覧が遅い | 一覧（`rbw list --raw`）は、門が復号して覚えているので、2回目以降は速い。遅いときは、`systemctl status bwvault-gate` で、起動し直されていないかを見る（更新や再起動の直後の1回目は、復号し直す） |
-| gate を更新した | まず `bash install/setup-bwvault.sh --check`（root 不要。システムの版との差分だけを表示）。読んでから `sudo bash install/setup-bwvault.sh`（差分と、何を再起動するかを表示し、`yes` の入力を求める。再起動するのは、gate 本体・gate の unit が変わったときの gate だけで、agent は再起動しません（解錠が外れるため）。置き済みの本物の rbw は上書きしません） |
-| rbw を更新した | 新しい `rbw`・`rbw-agent` を、`sudo install -m 0755 … /usr/local/lib/bwvault/` で置き直す |
-| ファームウェア更新などで解錠できなくなった | `sudo bwvault-admin seal-master`（TPM の PCR には結び付けていません） |
+| See the state | `systemctl status bwvault-agent bwvault-gate`, `journalctl -u bwvault-gate` (the log holds no item names, only short ids like `[a1b2c3d4]`) |
+| Lock, unlock or sync by hand | `sudo bwvault-admin lock` / `unlock` / `sync` |
+| You changed the master password | Run `sudo bwvault-admin seal-master` again |
+| Change the length of the confirmation windows | Put `BWVAULT_LIST_SECONDS`, `BWVAULT_GROUP_SECONDS` or `BWVAULT_SSH_GROUP_SECONDS` in `/etc/bwvault/gate.env`, then `sudo systemctl restart bwvault-gate` |
+| The list is slow | The gate decrypts the list (`rbw list --raw`) and remembers it, so it is fast from the second time on. If it is slow, check with `systemctl status bwvault-gate` that the gate was not restarted (the first time after an update or reboot decrypts again) |
+| You updated the gate | First `bash install/setup-bwvault.sh --check` (no root; only shows the diff against what is installed). Then `sudo bash install/setup-bwvault.sh` (shows the diff and what it will restart, and asks for `yes`; it restarts the gate only when the gate or its unit changed, and never restarts the agent, because that would lock it. It does not overwrite an installed rbw) |
+| You updated rbw | Put the new `rbw` and `rbw-agent` in place with `sudo install -m 0755 … /usr/local/lib/bwvault/` |
+| It no longer unlocks after a firmware update, etc. | `sudo bwvault-admin seal-master` (the seal is not bound to TPM PCRs) |
 
-## 使えないもの・制限
+## Limits
 
-- 標準の `rbw get` は、秘密の欄を断られます（`bwv get`・`bwv code` を使う。ラッパーが自動で差し替えます）。`--full`・`--field`・`--clipboard` は未対応。
-- TOTP は、base32 と `otpauth://` の形式（SHA1・SHA256・SHA512）だけです。Steam Guard（`steam://`）は未対応。
-- `rbw edit` / `remove` / `search` は使えません。`rbw add` は、ログイン項目だけです（SSH 鍵は bw-autotype 経由）。
-- パスキーのログインは、一覧と鍵の取り出しで、確認が 2 回です。
-- gate は Bitwarden の API に直接つなぎます（項目の新規作成・パスキーの一覧のため）。
-- 一覧の承認の窓の間は、同じユーザーの全プロセスが名前の一覧を見られます。窓を短くすると、確認が増えます。
-- 偽の認証ダイアログに、パスワードを打たされる攻撃は防げません（指紋が通る限りは、打つ場面がありません）。
-- SSH 署名は `ssh-keygen -Y sign` までを実機で確認しました。GitHub などの実サーバーへのログインは未確認です。
+- The stock `rbw get` is refused the secret fields (use `bwv get` and `bwv code`; the wrapper substitutes them). `--full`, `--field` and `--clipboard` are not supported.
+- TOTP: base32 and `otpauth://` only (SHA1, SHA256, SHA512). Steam Guard (`steam://`) is not supported.
+- `rbw edit`, `remove` and `search` do not work. `rbw add` creates login items only (SSH keys go through bw-autotype).
+- Signing in with a passkey needs two confirmations: the list, then the key.
+- The gate talks to Bitwarden's API directly (to create items and list passkeys).
+- During the list approval window, every process of your user can see the list of names. A shorter window means more confirmations.
+- It cannot stop a fake authentication dialog from getting you to type your password (as long as the fingerprint works, there is nothing to type).
+- SSH signing was checked on a real machine only up to `ssh-keygen -Y sign`; logging in to a real server such as GitHub has not been checked.
 
-## 試験
+## Tests
 
 ```sh
-tests/run.sh      # 偽の agent・偽の API・偽の polkit を使う。sudo も、実際の保管庫も要らない
+tests/run.sh      # uses a fake agent, a fake API and a fake polkit; needs neither sudo nor a real vault
 ```
 
-gate の約束（上の確認の一覧、承認の結び付け、解錠、書き込み、SSH、記録に名前を書かないこと）を確かめます。
-主な不具合（記録に名前を書く、一覧の確認を外す、承認を項目に結び付けない）を、わざと入れた gate で、試験が失敗することも確かめています。
+They check the gate's promises (the confirmations above, how approvals are bound, unlocking, writes, SSH, and that no names are logged).
+They are also checked to fail against deliberately broken gates (logging names, dropping the list confirmation, not binding approvals to an item).
 
-## 構成
+## Layout
 
 | | |
 |---|---|
-| `bin/bwvault-gate` | 門（Python、標準ライブラリ＋Gio）。bwvault の system サービス |
-| `bin/pinentry-bwvault` | rbw-agent が pinentry として呼ぶ。封印されたマスターパスワードを返す |
-| `bin/bwvault-admin` | `sudo bwvault-admin login / unlock / sync / seal-master / …`（bwvault としての rbw） |
-| `bin/bwv`, `bin/bwv-pull` | ユーザー側：項目の取り出し・コード・追加と、暗号化された写しの更新 |
-| `shim/rbw` | ユーザー側：`~/.local/bin/rbw` に置くラッパー |
-| `systemd/` | `bwvault-agent.service`、`bwvault-gate.service`、`user/bwvault-ssh.service` |
-| `polkit/`, `pam/` | polkit のアクション定義（4つ）、polkit 用の PAM 設定 |
-| `install/` | `setup-bwvault.sh`（sudo）、`install-user.sh` |
-| `docs/` | 設計の判断と教訓（`design.md`）、本家への Issue・PR の候補（`upstream-candidates.md`） |
+| `bin/bwvault-gate` | The gate (Python, standard library + Gio). A system service of `bwvault` |
+| `bin/pinentry-bwvault` | Called by rbw-agent as its pinentry; returns the sealed master password |
+| `bin/bwvault-admin` | `sudo bwvault-admin login / unlock / sync / seal-master / …` (rbw as `bwvault`) |
+| `bin/bwv`, `bin/bwv-pull` | Your side: fetching items, codes, adding items, and refreshing the encrypted copy |
+| `shim/rbw` | Your side: the wrapper to put at `~/.local/bin/rbw` |
+| `systemd/` | `bwvault-agent.service`, `bwvault-gate.service`, `user/bwvault-ssh.service` |
+| `polkit/`, `pam/` | The polkit action definitions (four), the PAM configuration for polkit |
+| `install/` | `setup-bwvault.sh` (sudo), `install-user.sh` |
+| `LICENSE` | MIT |
+| `docs/` | Design decisions and lessons (`design.md`), the gate protocol (`protocol.md`), candidate issues and PRs for upstream (`upstream-candidates.md`). **In Japanese** |
 
-## 取り外し
+## Uninstall
 
 ```sh
 systemctl --user disable --now bwvault-ssh.service && rm ~/.config/systemd/user/bwvault-ssh.service
-mv ~/.local/bin/rbw.bak-YYYYMMDD ~/.local/bin/rbw          # 旧 rbw に戻す（ラッパーのリンクを置き換える）
+mv ~/.local/bin/rbw.bak-YYYYMMDD ~/.local/bin/rbw          # back to the old rbw (replaces the wrapper's link)
 sudo systemctl disable --now bwvault-gate bwvault-agent
 sudo rm -r /etc/systemd/system/bwvault-*.service* /etc/bwvault /usr/local/lib/bwvault /usr/local/sbin/bwvault-admin \
            /usr/share/polkit-1/actions/io.github.dobinnmushi.bwvault.policy /etc/pam.d/polkit-1
-sudo userdel bwvault && sudo rm -r /var/lib/bwvault          # 保管庫のデータ（トークン・暗号化された DB）も消えます
+sudo userdel bwvault && sudo rm -r /var/lib/bwvault          # this also deletes the vault data (token, encrypted database)
 ```
 
-その後、旧 rbw で `rbw login` からやり直してください。
+Afterwards, run `rbw login` again with the old rbw.
 
-## ライセンスと謝辞
+## Reporting vulnerabilities
 
-rbw を無改造で使います（rbw のライセンスに従います）。このプロジェクト自体のライセンスは未定です。gate は、rbw のプロトコル（`src/protocol.rs`）と、agent 側で項目ごとに再確認する設計（`state.rs` のコメント）に学びました。
+If you think you found a vulnerability, please use the **Security** tab → "Report a vulnerability" (private reporting) on GitHub instead of a public issue.
+
+## License and credits
+
+[MIT](LICENSE). It uses rbw unmodified (rbw's own license applies). The gate learned from rbw's protocol (`src/protocol.rs`) and from the
+idea of re-confirming per item on the agent side (the comment in `state.rs`).
