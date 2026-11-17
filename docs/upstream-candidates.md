@@ -25,16 +25,26 @@
 - 未確認: 実装と試験（していない）。`set_master_password_reprompt` の作り直しや施錠との関係。実機で TOTP つき項目の確認が重なるか。
 - 出し方: まず #391 にコメント（下書きは作成済み）。PR を申し出るかは、あとで決める。
 
-## A. DB の保存を atomic にする（PR の候補。再現を作ってから）
+## A. DB の保存を atomic にする（PR の候補。再現できた）
 - 場所: rbw 1.15.0 `src/db.rs` の `Db::save` / `Db::save_async`。`File::create`（切り詰め）→ `write_all` で、フラッシュも rename もしない。
   ソースに本家自身の `XXX need to make this atomic` がある。
 - 症状: `rbw login` の直後の同期（`login_success` → `sync` の最初の `load_db`）で `failed to load db ... EOF while parsing a value at line 1 column 0`。
   DB にはトークンだけが書かれ、保管庫のデータが空のまま。`rbw sync` をやり直すと直る。
-- 再現した環境: 専用ユーザーの system サービスで rbw-agent を動かし、初回ログイン（2026-11-17 16:08）。1回だけ。
+- 最初に見た環境: 専用ユーザーの system サービスで rbw-agent を動かし、初回ログイン（2026-11-17 16:08）。1回だけ。
 - 既存の issue との関係（2026-11-18 に確認）: 「EOF while parsing」の issue（#148・#380）は、EU サーバーの `*_url` の設定漏れが原因とされたもので、**別件の可能性が高い**
   （以前、ここに「#148・#159 など、同種」と書いたのは誤り。#159 は見ていない）。タイトルの検索では、同じ内容の issue は見つからなかった（本文までは見ていない）。
-- 未確認: 原因が「書き込み前の読み出し」であること（tokio::fs::File は flush せずに drop すると書き込みが終わらないことがある、が有力）。小さな再現。
-- 修正案: 同じディレクトリに一時ファイルを作って書き、flush（と sync）してから `rename`。
+- **再現した（2026-11-18）**: rbw 1.15.0 のライブラリ（release ビルド、tmpfs）で、`Db::save_async` の直後に `Db::load` すると、
+  1000 回中 43%（ほぼ空のファイル）〜93%（約 880 KB）で `EOF while parsing a value at line 1 column 0`（実際の症状と同じ文面）。
+  手元の保管庫に近い大きさ（約 130 KB）でも 8〜9 割。`flush` を足した版と、一時ファイル＋`rename` の版は、300 回中 0 回。
+  エージェントの手順も同じ形: `login_success`（`src/bin/rbw-agent/actions.rs:339`）の `save_db` の直後に、`sync`（512）が `load_db` で読む。
+- 原因の見立て: `save_async` は、`File::create`（ファイルを空にする）→ `write_all` のあと、`flush` せずにファイルを閉じる。tokio の文書に、
+  flush せずに drop すると、書き込みが終わる前に返ることがある、という記述がある。tokio の内部の動きまでは追っていない。
+- 未確認: 実際のエージェントの `rbw login` が、どのくらいの割合でこれに当たるか（私が見たのは1回。多くの利用者が当たらない理由は分からない。
+  ランタイムやファイルシステムの違いかもしれない、は推測）。本物のログインでの再現はしていない。
+- 修正案: 同じディレクトリに一時ファイルを作って書き、`flush` してから `rename`（`save` と `save_async` の両方）。`flush` だけでも、この試験の症状は消えたが、
+  別のプロセスが「空にされた直後のファイル」を読む窓は残る（推測。測っていない）ので、`rename` がよい。
+- 再現の道具: 保存の直後に読むだけの小さなプログラム（rbw の `examples/` に置く形。保存の方法を `orig`・`flush`・`atomic` で切り替えて数える）。
+  置き場所はスクラッチパッドで、再起動で消える。
 
 ## B. agent 側の認証の拡張（Issue・議論。急がない）
 - `state.rs` のコメントにある `master_password_reprompt` の仕組み（agent が自分の同期から暗号文の集合を作り、該当の復号だけ再確認する）を、
