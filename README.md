@@ -21,7 +21,8 @@ Linux には、同じユーザーの中でプログラムを区別する権限�
 **守らない**:
 - root と、sudo を使える人。カーネルの脆弱性。物理的な攻撃（封印したマスターパスワードは、root なら `systemd-creds decrypt` で復号できます）
 - 承認した瞬間に、平文が呼び出し元（入力するプログラム）へ渡ること。キーロガー
-- 確認の画面を、あなたが何も考えずに通すこと（画面には、**どの項目か**と**要求元のプログラム**が出ます。見て判断する前提です）
+- 確認の画面を、あなたが何も考えずに通すこと（画面には、**どの項目か**と**要求元のプログラム**が出ます。見て判断する前提です）。
+  導入・更新の `yes` も同じで、差分を読んで、心当たりのない変更がないことを確かめてから入力してください
 - 一覧の承認の窓（既定 20 秒）の間は、同じユーザーの全プロセスが、名前の一覧を見られます（秘密は出ません）
 
 ## 仕組み
@@ -63,7 +64,8 @@ Linux には、同じユーザーの中でプログラムを区別する権限�
 `python3-gi`、`pinentry-curses`。
 
 ```sh
-sudo bash install/setup-bwvault.sh     # bwvault ユーザー・サービス・polkit の定義を入れる（何度実行しても同じ）
+bash install/setup-bwvault.sh --check  # 何が入るかを見る（root 不要）
+sudo bash install/setup-bwvault.sh     # bwvault ユーザー・サービス・polkit の定義を入れる。差分を表示して、yes の入力を求める
 sudo bwvault-admin login               # bwvault 側で Bitwarden にログイン（マスターパスワード、2段階認証）
 sudo bwvault-admin sync
 sudo bwvault-admin seal-master         # マスターパスワードを TPM2 で封印 → 以降は自動で解錠される
@@ -73,6 +75,17 @@ install/install-user.sh                # ユーザー側：rbw のラッパー�
 bw-autotype を使うなら、`~/.config/bw-autotype/config.toml` の `[auth] method = "none"`（確認は gate が行うので、二重にしない）。
 bw-passkey は、gate のソケットがあれば自動で gate を使います。
 
+### 導入スクリプトの安全確認
+
+`setup-bwvault.sh` は、root で、あなたのフォルダにあるファイルを、システムの大事な場所（`/etc/pam.d/polkit-1` を含む）へコピーします。
+悪意のあるプログラムが、先にそのフォルダを書き換えていても気づけるように、次のようにしています。
+
+- 入れるファイルを、**root 所有の一時置き場に先に写し**、その写しを表示し、その写しだけを入れる（表示と実際の内容がすり替わらない）。
+- システムの版との**差分**（新規なら SHA-256）を表示し、`yes` と入力しない限り、何も入れない。
+- `/etc/pam.d/polkit-1` が変わるときは、**別の確認**を、必ず対話で求める（`--yes` でも省けない。端末がなければ中止）。
+- rbw の実行ファイルは、控えてあるハッシュと照合する（違えば、確認する）。
+- 試験：`tests/test_setup.py`（改ざんが差分に出ること、確認を省けないこと）。
+
 ## 日常
 
 | 操作 | コマンド |
@@ -81,7 +94,7 @@ bw-passkey は、gate のソケットがあれば自動で gate を使います�
 | 手で施錠・解錠・同期 | `sudo bwvault-admin lock` / `unlock` / `sync` |
 | マスターパスワードを変えた | `sudo bwvault-admin seal-master` をやり直す |
 | 確認の窓の長さを変える | `/etc/bwvault/gate.env` に `BWVAULT_LIST_SECONDS` `BWVAULT_GROUP_SECONDS` `BWVAULT_SSH_GROUP_SECONDS` を書き、`sudo systemctl restart bwvault-gate` |
-| gate を更新した | `sudo bash install/setup-bwvault.sh`（置き済みの本物の rbw は上書きしません） |
+| gate を更新した | まず `bash install/setup-bwvault.sh --check`（root 不要。システムの版との差分だけを表示）。読んでから `sudo bash install/setup-bwvault.sh`（差分を表示し、`yes` の入力を求める。置き済みの本物の rbw は上書きしません） |
 | rbw を更新した | 新しい `rbw`・`rbw-agent` を、`sudo install -m 0755 … /usr/local/lib/bwvault/` で置き直す |
 | ファームウェア更新などで解錠できなくなった | `sudo bwvault-admin seal-master`（TPM の PCR には結び付けていません） |
 
