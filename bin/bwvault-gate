@@ -13,8 +13,8 @@
 - List（門独自）: 一覧（rbw list --raw と同じ形）を1回の要求で返す。復号した一覧は、保管庫が変わる（DB が変わる・Lock）まで門の中で覚える。
   確認は list（Decrypt と同じ窓）。一覧を、項目ごとの復号の往復（数百回）でやらずに済ませるため。
 - GetEntry（門独自）: 項目の ID を指定して、その項目の全欄を復号して返す（rbw get --raw と同じ形）。
-  polkit の確認は「プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。
-  同じプロセスが同じ項目をもう一度頼むときだけ、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
+  polkit の確認は「親プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。親が分からなければ、要求元のプロセスごと。
+  同じ親の子が同じ項目をもう一度頼むときだけ（rofi-rbw は rbw get と rbw code を別のプロセスで続けて起動する）、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
 - 施錠されていたら、使われた時点で agent を解錠させる（agent の pinentry は pinentry-bwvault で、封印されたマスターパスワードを返す）。
   解錠そのものは秘密を出さないので、本人確認は要らない。秘密を出す GetEntry だけが本人確認を通る。
 - AddEntry（門独自）: ログイン項目か SSH 鍵項目を新規に作る。暗号化は agent に頼み、Bitwarden の API へは門が送る
@@ -752,7 +752,9 @@ def handle_request(pid, action):
         entry = INDEX.by_id.get(action.get("id"))
         if entry is None:
             return error("no such entry")
-        if not authorize(pid, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry)):
+        # 承認は「親プロセス＋項目」。rofi-rbw は、1回の操作で rbw get と rbw code（TOTP）を、別のプロセスで続けて起動するので、
+        # 同じ親の子が同じ項目を頼むときは、聞き直さない。別の項目は必ず聞き直す。親が分からないときは、プロセスごと
+        if not authorize(pid, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=parent_of(pid)):
             return error("authorization denied")
         return {"type": "Entry", "entry": decrypt_entry(entry)}
     if kind == "PasskeyList":

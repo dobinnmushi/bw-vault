@@ -18,6 +18,7 @@ import shutil
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -191,6 +192,16 @@ def ask(action):
         return json.loads(s.makefile().readline())
 
 
+def ask_child(action):
+    """このプロセスの子として、別のプロセスから gate に要求する（pid は毎回違い、親は同じ）"""
+    code = ("import json,socket,sys\n"
+            "s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.settimeout(30)\n"
+            "s.sendall((json.dumps({'tty':None,'environment':None,'action':json.loads(sys.argv[2])})+'\\n').encode())\n"
+            "print(s.makefile().readline())\n")
+    r = subprocess.run([sys.executable, "-c", code, D + "/gate.sock", json.dumps(action)], capture_output=True, text=True, timeout=30)
+    return json.loads(r.stdout)
+
+
 def dec(cs):
     return ask({"type": "Decrypt", "cipherstring": cs, "entry_key": None, "org_id": None})
 
@@ -302,6 +313,31 @@ gate.polkit_check = boom
 n = len(calls)
 r = ask({"type": "GetEntry", "id": "e2"})
 check("polkit が失敗したら拒否（秘密は返らない）", r.get("type") == "Error" and all(c == "2.name2|a|b" for c in dcalls(n)))
+
+
+# ===== GetEntry の承認は「親プロセス＋項目」（rofi-rbw は、rbw get と rbw code を、別のプロセスで続けて起動するため）=====
+approve()
+orig_parent = gate.parent_of
+r1 = ask_child({"type": "GetEntry", "id": "e1"})                 # rbw get --raw（1つ目の子プロセス）
+r2 = ask_child({"type": "GetEntry", "id": "e1"})                 # rbw code（2つ目の子プロセス）
+r3 = ask_child({"type": "GetEntry", "id": "e1"})                 # rbw code（3つ目）
+check("同じ親の別々の子プロセスが、同じ項目を続けて頼んでも、確認は1回だけ（TOTP つき項目のパスワード入力）",
+      [x.get("type") for x in (r1, r2, r3)] == ["Entry"] * 3 and len(asked(SECRET)) == 1)
+r4 = ask_child({"type": "GetEntry", "id": "e2"})
+check("同じ親の子でも、別の項目は必ず聞き直す（項目ごとの承認は保たれる）",
+      r4.get("type") == "Entry" and [i for _, i in asked(SECRET)] == ["PT:2.name|a|b", "PT:2.name2|a|b"])
+approve()
+gate.parent_of = lambda pid: (999991, 1)
+ask_child({"type": "GetEntry", "id": "e1"})
+gate.parent_of = lambda pid: (999992, 1)
+ask_child({"type": "GetEntry", "id": "e1"})
+check("親が違えば、同じ項目でも承認を引き継げない（別のプログラムが勝手に起動した子は通らない）", len(asked(SECRET)) == 2)
+approve()
+gate.parent_of = lambda pid: None
+ask_child({"type": "GetEntry", "id": "e1"})
+ask_child({"type": "GetEntry", "id": "e1"})
+check("親が分からないときは、プロセスごとに聞く（引き継がない）", len(asked(SECRET)) == 2)
+gate.parent_of = orig_parent
 
 # ===== 自動解錠 =====
 approve()
