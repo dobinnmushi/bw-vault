@@ -57,6 +57,13 @@ def raises(f):
     try: f(); return False
     except ValueError: return True
 t("対応しない形式（steam://）は ValueError", raises(lambda: bwv.totp_code("steam://ABCDEFGH")), True)
+def message(f):
+    try: f(); return None
+    except ValueError as e: return str(e)
+for label, bad in (("全角の右かっこが混ざる", b32(sec1).rstrip("=") + "）"), ("base32 にない文字（1・0・8）", "JBSWY3DPEHPK3PX1"), ("半角の記号", "JBSWY3DP-HPK3PXP")):
+    t(f"シークレットが不正（{label}）なら、原因が分かる文面の ValueError", "base32 として正しくありません" in (message(lambda bad=bad: bwv.totp_code(bad)) or ""), True)
+t("不正なシークレットの文面に、Python の内部の言葉（ASCII・padding など）が出ない",
+  not any(w in (message(lambda: bwv.totp_code(b32(sec1).rstrip("=") + "）")) or "") for w in ("ASCII", "padding", "Incorrect", "Non-base32")), True)
 t("対応しないアルゴリズムは ValueError", raises(lambda: bwv.totp_code(f"otpauth://totp/x?secret={b32(sec1)}&algorithm=MD5")), True)
 
 t("従来の経路が呼ぶ rbw の既定値は、PATH 上のラッパーではなく、実体の絶対パス（呼び合いの無限ループを防ぐ）",

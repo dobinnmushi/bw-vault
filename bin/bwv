@@ -142,7 +142,11 @@ def totp_code(secret, now=None):
         raise ValueError("unsupported TOTP format")
     if algo not in ("SHA1", "SHA256", "SHA512") or not 4 <= digits <= 10 or period <= 0:
         raise ValueError("unsupported TOTP parameters")
-    key = base64.b32decode("".join(secret.split()).upper().rstrip("=") + "=" * (-len("".join(secret.split()).rstrip("=")) % 8))
+    compact = "".join(secret.split())
+    try:
+        key = base64.b32decode(compact.upper().rstrip("=") + "=" * (-len(compact.rstrip("=")) % 8))
+    except ValueError:      # 全角の文字や、base32 にない文字（0・1・8・9 や記号）が混ざっているとき
+        raise ValueError("TOTP のシークレットが base32 として正しくありません / the TOTP secret is not valid base32") from None
     counter = int((time.time() if now is None else now) // period)
     mac = hmac.new(key, struct.pack(">Q", counter), getattr(hashlib, algo.lower())).digest()
     off = mac[-1] & 0x0F
