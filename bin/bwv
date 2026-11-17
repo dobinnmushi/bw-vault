@@ -4,8 +4,9 @@
   bwv list --raw                                       項目の一覧（rbw list --raw と同じ形の JSON。門が1回の要求で返す）
   bwv get [--raw] [--public] [-i] [--folder F] 名前または UUID [ユーザー名]
                                                        --public: 秘密を除いた欄だけ（ユーザー名・URI など）。一覧の確認だけで返り、項目の確認は出ない
-  bwv code [-i] [--folder F] 名前または UUID [ユーザー名]   TOTP のコード（rofi-rbw が rbw code で呼ぶ）
+  bwv code [-i] [--folder F] 名前または UUID [ユーザー名]   TOTP のコード（rofi-rbw が rbw code で呼ぶ）。門が今のコードだけを返す（種は取らない）
   bwv add [--uri U] [--folder F] 名前 [ユーザー名]    標準入力の1行目がパスワード、残りがノート（rbw add と同じ）
+  bwv add --json [--uri U] [--folder F] 名前 [ユーザー名]   標準入力は JSON {"password","notes","totp"}（totp は任意。種を引数に出さないため）
   bwv add --ssh [--folder F] 名前                      標準入力は JSON {"private_key","public_key","fingerprint"}
 
 項目の探し方は rbw get と同じ（名前が完全一致 → 部分一致の順、ユーザー名・フォルダで絞る）。ただし探すのは
@@ -180,7 +181,18 @@ def parse_editor(contents):
 
 def cmd_add(a):
     stdin = sys.stdin.read()
-    if a.ssh:
+    if a.ssh and a.json:
+        die("--ssh と --json は、一緒に使えません")
+    if a.json:
+        try:
+            k = json.loads(stdin)
+            if not isinstance(k, dict):
+                raise ValueError
+            action = {"type": "AddEntry", "kind": "login", "name": a.name, "user": a.user, "uri": a.uri, "folder": a.folder,
+                      "password": k.get("password"), "notes": k.get("notes"), "totp": k.get("totp")}
+        except ValueError:
+            die("標準入力は {\"password\", \"notes\", \"totp\"} の JSON にしてください")
+    elif a.ssh:
         try:
             k = json.loads(stdin)
             action = {"type": "AddEntry", "kind": "ssh", "name": a.name, "folder": a.folder,
@@ -195,6 +207,9 @@ def cmd_add(a):
     if res.get("type") != "Ack":
         die(res.get("error", str(res)))
     subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "bwv-pull")])   # 新しい項目を rbw list に見せる
+    if action.get("totp") and res.get("totp") is not True:      # 古い門は、知らない欄を黙って捨てる。保存できたと思わせない
+        die("この門は TOTP のシークレットを保存できません。項目は、TOTP なしで作られました。門を更新してください"
+            " / this gate cannot store a TOTP secret; the item was created WITHOUT it. Update the gate")
 
 
 def main():
@@ -220,6 +235,7 @@ def main():
     ad.add_argument("--uri")
     ad.add_argument("--folder")
     ad.add_argument("--ssh", action="store_true")
+    ad.add_argument("--json", action="store_true")
     a = ap.parse_args()
     if a.cmd == "add":
         return cmd_add(a)
@@ -233,6 +249,15 @@ def main():
     except ValueError:
         needle = ("name", a.needle)
     e = find_entry(list_entries(), needle, a.user, a.folder, a.ignore_case)
+    if a.cmd == "code":
+        # 門が、種を門の中で計算して、今のコードだけを返す（種は、あなたの側のプロセスに来ない）
+        res = gate_call({"type": "Totp", "id": e["id"]})
+        if res.get("type") == "Totp":
+            print(res["code"])
+            return
+        err = str(res.get("error", res))
+        if "is not allowed" not in err:        # 古い門は Totp を知らない。そのときだけ、従来の経路（種を取って手元で計算）に戻る
+            die(f"entry for '{a.needle}' had no totp secret" if "has no totp" in err else err)
     entry = get_entry(e["id"], public=getattr(a, "public", False))
     if a.cmd == "code":
         secret = (entry.get("data") or {}).get("totp")

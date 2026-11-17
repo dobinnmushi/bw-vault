@@ -91,6 +91,7 @@ gate = types.ModuleType("gate")
 SourceFileLoader("gate", os.path.join(HERE, "..", "bin", "bwvault-gate")).exec_module(gate)
 
 # ---- 合成した DB（暗号文の代わりに "2.名前|a|b" の形。偽の agent は "PT:" を付けて返す）----
+SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"      # RFC 6238 の試験用の鍵 "12345678901234567890" の base32。T=59 秒で 287082
 BLOB = S(b"ssh-ed25519") + S(b"K" * 32)
 PUB = "ssh-ed25519 " + base64.b64encode(BLOB).decode() + " comment"
 e1 = {"id": "e1", "org_id": None, "folder": "2.folder|a|b", "folder_id": None, "name": "2.name|a|b",
@@ -136,6 +137,8 @@ class Agent(socketserver.StreamRequestHandler):
                 r = {"type": "Error", "error": "agent is locked"}
             elif a["cipherstring"] == "2.sshpub|a|b":
                 r = {"type": "Decrypt", "plaintext": PUB}
+            elif a["cipherstring"] == "2.totp|a|b":
+                r = {"type": "Decrypt", "plaintext": SEED}
             else:
                 r = {"type": "Decrypt", "plaintext": "PT:" + a["cipherstring"]}
         else:
@@ -283,6 +286,7 @@ for t in ("Encrypt", "Quit", "ClipboardStore", "Register", "Frobnicate"):
 
 # ===== GetEntry: 承認は項目ごと =====
 approve()
+n0 = len(calls)
 r1 = ask({"type": "GetEntry", "id": "e1"})
 check("GetEntry は、項目の名前を出した secret の確認が1回出る", asked(SECRET) == [(SECRET, "PT:2.name|a|b")])
 ask({"type": "GetEntry", "id": "e1"})
@@ -291,13 +295,41 @@ r2 = ask({"type": "GetEntry", "id": "e2"})
 check("別の項目は必ず聞き直す（承認を引き継げない）", asked(SECRET) == [(SECRET, "PT:2.name|a|b"), (SECRET, "PT:2.name2|a|b")])
 e = r1["entry"]
 check("rbw get --raw と同じキー", list(e) == ["id", "folder", "name", "data", "fields", "notes", "history"])
-check("Login の data", e["data"] == {"username": "PT:2.user|a|b", "password": "PT:2.pass|a|b", "totp": "PT:2.totp|a|b",
+check("Login の data（TOTP の種は返さず、「ある」という印だけ）", e["data"] == {"username": "PT:2.user|a|b", "password": "PT:2.pass|a|b", "totp": gate.TOTP_HIDDEN,
                                     "uris": [{"uri": "PT:2.uri|a|b", "match_type": None}]})
+check("GetEntry は、TOTP の種を答えのどこにも出さず、種の暗号文は復号もしない", SEED not in json.dumps(r1) and "2.totp|a|b" not in dcalls(n0))
 check("fields / notes / history / folder", e["fields"] == [{"name": "PT:2.fname|a|b", "value": "PT:2.fval|a|b", "type": None}]
       and e["notes"] == "PT:2.notes|a|b" and e["history"] == [{"last_used_date": "x", "password": "PT:2.hist|a|b"}]
       and e["folder"] == "PT:2.folder|a|b")
 check("SecureNote の data は null", r2["entry"]["data"] is None and r2["entry"]["notes"] == "PT:2.notes2|a|b")
 check("存在しない ID は断る", ask({"type": "GetEntry", "id": "nope"}).get("type") == "Error")
+
+# ===== Totp: 種は門の外に出ない（コードだけを返す）=====
+approve()
+n = len(calls)
+gate._clock = lambda: 59
+r = ask({"type": "Totp", "id": "e1"})
+check("Totp は、コードだけを返す（RFC 6238 の例: T=59 秒で 287082）", r == {"type": "Totp", "code": "287082"})
+check("Totp は、項目の名前を出した secret の確認が1回出る", asked(SECRET) == [(SECRET, "PT:2.name|a|b")])
+check("種は答えのどこにも出ず、復号したのは TOTP の暗号文だけ（パスワードなどは復号しない）",
+      SEED not in json.dumps(r) and "2.totp|a|b" in dcalls(n) and set(dcalls(n)) <= {"2.name|a|b", "2.totp|a|b"})
+gate._clock = lambda: 1111111109
+check("時刻が進めば、コードも変わる（T=1111111109 秒で 081804）", ask({"type": "Totp", "id": "e1"}).get("code") == "081804")
+gate._clock = time.time
+approve(False)
+n = len(calls)
+r = ask({"type": "Totp", "id": "e1"})
+check("確認が通らなければ、Totp は断られ、種は復号されない", r.get("type") == "Error" and "2.totp|a|b" not in dcalls(n))
+approve()
+check("TOTP のない項目は、確認も出さずに断る", ask({"type": "Totp", "id": "e2"}).get("type") == "Error" and polk == [])
+check("存在しない ID は、確認も出さずに断る", ask({"type": "Totp", "id": "nope"}).get("type") == "Error" and polk == [])
+ask_child({"type": "GetEntry", "id": "e1"})
+ask_child({"type": "Totp", "id": "e1"})
+ask_child({"type": "Totp", "id": "e1"})
+check("同じ親の GetEntry と Totp は、確認を共有する（rofi-rbw は、パスワードを入力したあとにコードを取る。確認は1回）", len(asked(SECRET)) == 1)
+ask_child({"type": "Totp", "id": "e3"})
+check("TOTP のない項目（SSH 鍵）は、親が同じでも、確認なしで断られ、承認も作らない", len(asked(SECRET)) == 1)
+approve()
 approve(False)
 n = len(calls)
 r = ask({"type": "GetEntry", "id": "e1"})
@@ -485,6 +517,29 @@ check("全欄が agent で暗号化されて送られる（平文は API に出�
       and body["login"] == {"Username": "ENC(me)", "Password": "ENC(pw1)", "Totp": None, "Uris": [{"Uri": "ENC(https://x.example)", "Match": None}]}
       and "pw1" not in json.dumps(body).replace("ENC(pw1)", ""))
 check("トークンは bwvault の DB のもの", c[3] == "Bearer SECRET-TOKEN")
+for label, given in (("空白・小文字", " jbsw y3dp ehpk 3pxp "), ("全角", "ＪＢＳＷＹ３ＤＰＥＨＰＫ３ＰＸＰ")):
+    approve()
+    r = ask({"type": "AddEntry", "kind": "login", "name": "site-totp", "password": "pw", "totp": given})
+    body = [x for x in api_log if x[0] == "POST" and x[1] == "/api/ciphers"][-1][2]
+    check(f"TOTP のシークレット（{label}）は、半角・大文字に整えて、暗号化して送る。確認に「TOTP つき」と出る",
+          r == {"type": "Ack", "totp": True} and body["login"]["Totp"] == "ENC(JBSWY3DPEHPK3PXP)"
+          and polk == [(WRITE, "新規登録（ログイン・TOTP つき）: site-totp")] and "JBSWY3DPEHPK3PXP" not in json.dumps(body).replace("ENC(JBSWY3DPEHPK3PXP)", ""))
+approve()
+uri = "otpauth://totp/Ex:me?secret=JBSWY3DPEHPK3PXP&issuer=Ex&digits=8"
+r = ask({"type": "AddEntry", "kind": "login", "name": "site-uri", "password": "pw", "totp": "  " + uri + " "})
+check("otpauth:// の URI は、前後の空白だけを除いて、そのまま保存する",
+      r.get("type") == "Ack" and [x for x in api_log if x[1] == "/api/ciphers"][-1][2]["login"]["Totp"] == f"ENC({uri})")
+approve()
+n_api = len(api_log)
+for label, bad in (("全角の右かっこ", "JBSWY3DPEHPK3PXP）"), ("base32 にない文字", "JBSWY3DPEHPK3PX1"), ("対応しない形式", "steam://ABCDEFGH"),
+                   ("数でない桁数", "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=six"), ("文字列でない", 123)):
+    r = ask({"type": "AddEntry", "kind": "login", "name": "site-bad", "password": "pw", "totp": bad, "folder": "newfolder2"})
+    check(f"使えない TOTP のシークレット（{label}）は、確認も出さず、フォルダも作らず、断る",
+          r.get("type") == "Error" and polk == [] and len(api_log) == n_api)
+r = ask({"type": "AddEntry", "kind": "login", "name": "site-empty", "password": "pw", "totp": "   "})
+check("空の TOTP は、TOTP なしの項目として保存する（Ack に totp の印は付かない）", r == {"type": "Ack"} and [x for x in api_log if x[1] == "/api/ciphers"][-1][2]["login"]["Totp"] is None
+      and polk == [(WRITE, "新規登録（ログイン）: site-empty")])
+approve()
 check("登録後に agent の同期を呼ぶ", calls[-1]["type"] == "Sync")
 r = ask({"type": "AddEntry", "kind": "login", "name": "site2", "password": "pw2", "folder": "newfolder"})
 check("無いフォルダは作ってから使う", r.get("type") == "Ack"
@@ -618,7 +673,7 @@ c.close()
 gate.parent_of = orig_parent
 
 # ===== 記録（journal）に、項目名などを書かない =====
-leaks = [m for m in logs if "PT:" in m or "ENC(" in m or any(w in m for w in ("sshname", "pkname", "example.com", "site", "mykey"))]
+leaks = [m for m in logs if "PT:" in m or "ENC(" in m or any(w in m for w in ("sshname", "pkname", "example.com", "site", "mykey", SEED, "JBSWY3DP"))]
 check("gate の記録に、項目名・サイト名・秘密が一切含まれない", not leaks)
 check("記録には、確認の許可・拒否が短い識別子つきで残る", any(m.startswith("許可: ") and "[" in m for m in logs) and any(m.startswith("拒否: ") for m in logs))
 if leaks:

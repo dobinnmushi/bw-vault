@@ -15,11 +15,14 @@
 - GetEntry（門独自）に "public": true を付けると、秘密を除いた欄（名前・フォルダ・ユーザー名・URI・SSH の公開鍵と指紋）だけを、
   同じ形で返す（ほかの欄は null か空）。これらは一覧の確認で、すでに見える欄なので、確認は list だけ（項目の確認は出ない）。
 - GetEntry（門独自）: 項目の ID を指定して、その項目の全欄を復号して返す（rbw get --raw と同じ形）。
+  ただし TOTP のシークレット（種）は返さない（「ある」という印の文字列にする）。種は30秒で変わるコードと違い、盗まれると、ずっと使える。
   polkit の確認は「親プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。親が分からなければ、要求元のプロセスごと。
   同じ親の子が同じ項目をもう一度頼むときだけ（rofi-rbw は rbw get と rbw code を別のプロセスで続けて起動する）、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
+- Totp（門独自）: 項目の ID を指定して、その項目の今の TOTP のコード（6桁など）だけを返す。種は門の中で復号して計算し、外には出さない。
+  確認は GetEntry と同じ（親プロセス＋項目。同じ親の GetEntry と確認を共有する）。
 - 施錠されていたら、使われた時点で agent を解錠させる（agent の pinentry は pinentry-bwvault で、封印されたマスターパスワードを返す）。
   解錠そのものは秘密を出さないので、本人確認は要らない。秘密を出す GetEntry だけが本人確認を通る。
-- AddEntry（門独自）: ログイン項目か SSH 鍵項目を新規に作る。暗号化は agent に頼み、Bitwarden の API へは門が送る
+- AddEntry（門独自）: ログイン項目（TOTP のシークレットつきでもよい。門で整えて検証する）か SSH 鍵項目を新規に作る。暗号化は agent に頼み、Bitwarden の API へは門が送る
   （アクセストークンは bwvault の DB にしかない）。polkit の確認（write）を通ってから行う。
 - PasskeyList / PasskeyGet / AddEntry(kind=passkey)（門独自。bw-passkey 用）: パスキーの一覧（サイト名・ユーザー名・credentialId など。
   秘密鍵を含まない）は一覧の確認（list。項目の一覧と同じ窓）で返し、秘密鍵は PasskeyGet でパスキー1つごとに polkit の確認を通してから返す。
@@ -38,6 +41,7 @@ SO_PEERPIDFD（Linux 6.5 以降）で、読んでいる間に相手が終わっ�
 import base64
 import collections
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -48,7 +52,9 @@ import struct
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 
 AGENT_SOCK = os.environ.get("BWVAULT_AGENT_SOCKET", "/run/bwvault/rbw/socket")
@@ -367,10 +373,65 @@ class ListCache:
 LIST_CACHE = ListCache()
 
 
+# ---- TOTP（RFC 6238）----
+
+TOTP_HIDDEN = "(hidden by bw-vault: use rbw code)"      # GetEntry で、種の代わりに返す（rofi-rbw などは「ある」ことだけを見る）
+_clock = time.time
+
+
+def totp_code(secret, now=None):
+    """TOTP（RFC 6238）のコード。secret は base32 の文字列か、otpauth://totp/...?secret=…&algorithm=…&digits=…&period=… の URI。
+    Steam Guard（steam://）などは扱わない。使えない形は ValueError（文面に secret は含めない）"""
+    secret = secret.strip()
+    algo, digits, period = "SHA1", 6, 30
+    if secret.lower().startswith("otpauth://"):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(secret).query)
+        secret = q.get("secret", [""])[0]
+        algo = q.get("algorithm", [algo])[0].upper()
+        try:
+            digits = int(q.get("digits", [digits])[0])
+            period = int(q.get("period", [period])[0])
+        except ValueError:
+            raise ValueError("unsupported TOTP parameters") from None
+    elif "://" in secret:
+        raise ValueError("unsupported TOTP format")
+    if algo not in ("SHA1", "SHA256", "SHA512") or not 4 <= digits <= 10 or period <= 0:
+        raise ValueError("unsupported TOTP parameters")
+    compact = "".join(secret.split())
+    try:
+        key = base64.b32decode(compact.upper().rstrip("=") + "=" * (-len(compact.rstrip("=")) % 8))
+    except ValueError:
+        raise ValueError("TOTP のシークレットが base32 として正しくありません / the TOTP secret is not valid base32") from None
+    if not key:
+        raise ValueError("TOTP のシークレットが空です / the TOTP secret is empty")
+    counter = int((time.time() if now is None else now) // period)
+    mac = hmac.new(key, struct.pack(">Q", counter), getattr(hashlib, algo.lower())).digest()
+    off = mac[-1] & 0x0F
+    return str((struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+def normalize_totp(value):
+    """保管庫に入れる TOTP のシークレットを整えて、計算できるか確かめる。空なら None。使えない形は ValueError。
+    base32 なら、全角を半角に、空白を除いて大文字にする。otpauth:// の URI は、前後の空白だけを除く"""
+    if value is None or not isinstance(value, str):
+        if value is None:
+            return None
+        raise ValueError("bad totp")
+    if len(value) > 10000:
+        raise ValueError("bad totp")
+    s = value.strip()
+    if not s:
+        return None
+    if not s.lower().startswith("otpauth://"):
+        s = "".join(unicodedata.normalize("NFKC", s).split()).upper().rstrip("=")
+    totp_code(s)
+    return s
+
+
 # ---- 項目の取り出し（rbw get --raw と同じ形の JSON）----
 
 FIELD_TYPES = {0: "text", 1: "hidden", 2: "boolean", 3: "linked"}
-LOGIN_KEYS = ("username", "password", "totp")
+LOGIN_KEYS = ("username", "password")
 CARD_KEYS = ("cardholder_name", "number", "brand", "exp_month", "exp_year", "code")
 IDENTITY_KEYS = ("title", "first_name", "middle_name", "last_name", "address1", "address2", "address3", "city",
                  "state", "postal_code", "country", "phone", "email", "ssn", "license_number", "passport_number",
@@ -405,6 +466,7 @@ def decrypt_entry(entry, public=False):
     if isinstance(data, dict) and "Login" in data:
         d = data["Login"]
         out = pick(d, LOGIN_KEYS, ("username",))
+        out["totp"] = TOTP_HIDDEN if d.get("totp") and not public else None      # 種は、復号もしない
         out["uris"] = [{"uri": dec_soft(u["uri"]), "match_type": u.get("match_type")} for u in d.get("uris") or []]
     elif isinstance(data, dict) and "Card" in data:
         out = pick(data["Card"], CARD_KEYS, ())
@@ -498,7 +560,7 @@ def add_entry(action):
         uri = text(action, "uri", 10000)
         cipher = {"type": 1, "folderId": fid, "name": enc(name), "notes": enc(text(action, "notes")),
                   "login": {"Username": enc(text(action, "user", 1000)), "Password": enc(text(action, "password", 10000)),
-                            "Totp": None, "Uris": [{"Uri": enc(uri), "Match": None}] if uri else []}}
+                            "Totp": enc(action.get("totp")), "Uris": [{"Uri": enc(uri), "Match": None}] if uri else []}}
     elif kind == "ssh":
         cipher = {"type": 5, "folderId": fid, "name": enc(name), "notes": None,
                   "sshKey": {"privateKey": enc(text(action, "private_key", required=True)),
@@ -781,7 +843,7 @@ def handle_request(peer, action):
         return r
     if kind == "Login":
         return {"type": "Ack"}      # ログインは bwvault 側で済ませてある
-    if kind in ("CheckLock", "Unlock", "GetEntry", "Decrypt", "AddEntry", "PasskeyList", "PasskeyGet", "List"):
+    if kind in ("CheckLock", "Unlock", "GetEntry", "Totp", "Decrypt", "AddEntry", "PasskeyList", "PasskeyGet", "List"):
         try:
             ensure_unlocked()
         except Exception as e:
@@ -819,6 +881,26 @@ def handle_request(peer, action):
         if not authorize(peer, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=peer.parent):
             return error("authorization denied")
         return {"type": "Entry", "entry": decrypt_entry(entry)}
+    if kind == "Totp":
+        INDEX.refresh()
+        entry = INDEX.by_id.get(action.get("id"))
+        if entry is None:
+            return error("no such entry")
+        login = entry["data"].get("Login") if isinstance(entry.get("data"), dict) else None
+        if not login or not login.get("totp"):
+            return error("the entry has no totp")
+        # 確認は GetEntry と同じ鍵（親プロセス＋項目）。rofi-rbw は、パスワードの入力のあとにコードを取るので、確認を共有する
+        if not authorize(peer, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=peer.parent):
+            return error("authorization denied")
+        try:
+            r = agent_call({"type": "Decrypt", "cipherstring": login["totp"],
+                            "entry_key": entry.get("key"), "org_id": entry.get("org_id")})
+            if r.get("type") != "Decrypt":
+                raise RuntimeError(r.get("error", "decrypt failed"))
+            return {"type": "Totp", "code": totp_code(r["plaintext"], now=_clock())}
+        except (RuntimeError, OSError, ValueError) as e:
+            log(f"TOTP のコードを作れません: {type(e).__name__}")
+            return error(f"could not generate the code: {e}")
     if kind == "PasskeyList":
         if not authorize_list(peer):
             return error("authorization denied")
@@ -859,14 +941,20 @@ def handle_request(peer, action):
         if not isinstance(name, str):
             return error("bad request")
         what = "SSH 鍵" if action.get("kind") == "ssh" else "ログイン"
-        if not authorize(peer, name, ACTION_WRITE, lambda: f"新規登録（{what}）: {name}"):
+        try:      # 確認を出す前に、使えない TOTP のシークレットは断る（確認の画面を無駄に出さない）。整えた形で保存する
+            totp = normalize_totp(action.get("totp")) if action.get("kind") == "login" else None
+        except ValueError as e:
+            return error(f"bad totp: {e}")
+        if totp:
+            what += "・TOTP つき"
+        if not authorize(peer, name + ("\0totp" if totp else ""), ACTION_WRITE, lambda: f"新規登録（{what}）: {name}"):
             return error("authorization denied")
         try:
-            add_entry(action)
+            add_entry(dict(action, totp=totp))
         except (ValueError, RuntimeError, OSError) as e:
             log(f"登録に失敗: {type(e).__name__}: {e}")
             return error(f"could not add the entry: {e}")
-        return {"type": "Ack"}
+        return {"type": "Ack", "totp": True} if totp else {"type": "Ack"}      # 印: 古い門は黙って捨てるので、クライアントが確かめられる
     if kind == "Decrypt":
         cs = action.get("cipherstring")
         if not isinstance(cs, str):

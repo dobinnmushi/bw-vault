@@ -77,10 +77,11 @@ os.makedirs(W + "/bin")
 os.symlink(os.path.realpath(SHIM), W + "/bin/rbw")                      # PATH 上の rbw は、ラッパー
 open(W + "/real-rbw", "w").write('#!/bin/sh\necho "$@" >> %s/real.log\necho \'[{"id":"old","name":"from-real-rbw","user":null,"folder":null,"uris":[],"type":"Note"}]\'\n' % W)
 os.chmod(W + "/real-rbw", 0o755)
-GATE_MODE = {"list": True}
+GATE_MODE = {"list": True, "totp": True, "add_marks_totp": True}
 seen_actions = []
 full_actions = []
-ENTRIES = [{"id": "1", "name": "a", "user": "u", "folder": None, "uris": ["https://a.example"], "type": "Login"}]
+ENTRIES = [{"id": "1", "name": "a", "user": "u", "folder": None, "uris": ["https://a.example"], "type": "Login"},
+           {"id": "2", "name": "notp", "user": None, "folder": None, "uris": [], "type": "Login"}]
 
 
 class FakeGate(socketserver.StreamRequestHandler):
@@ -90,9 +91,14 @@ class FakeGate(socketserver.StreamRequestHandler):
         full_actions.append(a)
         if a["type"] == "List" and GATE_MODE["list"]:
             r = {"type": "List", "entries": ENTRIES}
+        elif a["type"] == "Totp" and GATE_MODE["totp"]:
+            r = {"type": "Totp", "code": "123456"} if a["id"] == "1" else {"type": "Error", "error": "the entry has no totp"}
+        elif a["type"] == "AddEntry":
+            r = {"type": "Ack", **({"totp": True} if a.get("totp") and GATE_MODE["add_marks_totp"] else {})}
         elif a["type"] == "GetEntry":
             r = {"type": "Entry", "entry": {"id": a["id"], "folder": None, "name": "a",
-                                            "data": {"username": "u", "password": None if a.get("public") else "pw", "totp": None, "uris": []},
+                                            "data": {"username": "u", "password": None if a.get("public") else "pw",
+                                                     "totp": None if a.get("public") else b32(sec1), "uris": []},
                                             "fields": [], "notes": None, "history": []}}
         else:
             r = {"type": "Error", "error": f"{a['type']} is not allowed"}
@@ -144,6 +150,57 @@ get_actions = [x for x in full_actions if x["type"] == "GetEntry"]
 t("--public がなければ、public は付けない（従来どおり、全欄＋項目の確認）",
   (code, len(get_actions), "public" in get_actions[0] if get_actions else None, json.loads(out)["data"]["password"] if code == 0 else "?"),
   (0, 1, False, "pw"))
+# --- code: 門が今のコードだけを返す（種は取らない）。古い門（Totp を知らない）は、従来の経路に戻る
+full_actions.clear()
+code, out, err = run_rbw("code", "a")
+t("rbw code: 新しい門の Totp でコードだけを受け取り、種を取る GetEntry は呼ばない",
+  (code, out.strip(), [x["type"] for x in full_actions if x["type"] in ("Totp", "GetEntry")]), (0, "123456", ["Totp"]))
+code, out, err = run_rbw("code", "notp")
+t("TOTP のない項目: 終了コード 1 で、「had no totp secret」", (code, "had no totp secret" in err, out), (1, True, ""))
+GATE_MODE["totp"] = False
+full_actions.clear()
+before = bwv.totp_code(b32(sec1))
+code, out, err = run_rbw("code", "a")
+after = bwv.totp_code(b32(sec1))
+t("古い門（Totp を知らない）: 従来の経路（種を取って、手元で計算）に戻る（30 秒の境目をまたいでもよい）",
+  (code, out.strip() in (before, after), "GetEntry" in [x["type"] for x in full_actions]), (0, True, True))
+GATE_MODE["totp"] = True
+
+# --- add --json: 標準入力の JSON で、TOTP のシークレットを渡す（コマンドの引数に出さない）
+BWV = os.path.join(os.path.dirname(SHIM), "..", "bin", "bwv")
+os.makedirs(W + "/.config/rbw", exist_ok=True)
+open(W + "/.config/rbw/config.json", "w").write('{"email": "x@example.com"}')
+
+
+def run_add(stdin, *args):
+    return subprocess.run([BWV, "add", "--json", *args], input=stdin, env=env, capture_output=True, text=True, timeout=30)
+
+
+full_actions.clear()
+r = run_add(json.dumps({"password": "pw", "notes": "memo", "totp": " jbsw "}), "site", "me", "--uri", "https://x.example", "--folder", "F")
+a = [x for x in full_actions if x["type"] == "AddEntry"][-1]
+t("bwv add --json: 標準入力の password・notes・totp と、引数の名前・ユーザー名・URI・フォルダを、門の AddEntry に渡す",
+  (r.returncode, a["kind"], a["name"], a["user"], a["uri"], a["folder"], a["password"], a["notes"], a["totp"]),
+  (0, "login", "site", "me", "https://x.example", "F", "pw", "memo", " jbsw "))
+full_actions.clear()
+r = subprocess.run([BWV, "add", "--totp", "JBSWY3DPEHPK3PXP", "site-argv"], env=env, capture_output=True, text=True, input="pw\n", timeout=30)
+t("種を、コマンドの引数で渡す手段はない（--totp は受け付けず、門にも頼まない）",
+  (r.returncode, [x for x in full_actions if x["type"] == "AddEntry"]), (2, []))
+r = run_add(json.dumps({"password": "pw"}), "site2")
+t("TOTP なしの --json は、そのまま保存できる（totp は null）", (r.returncode, [x for x in full_actions if x["type"] == "AddEntry"][-1]["totp"]), (0, None))
+GATE_MODE["add_marks_totp"] = False
+r = run_add(json.dumps({"password": "pw", "totp": "JBSWY3DPEHPK3PXP"}), "site3")
+t("古い門に TOTP つきで頼むと、保存できなかったと知らせて終了コード 1（黙って TOTP なしにしない）",
+  (r.returncode, "WITHOUT" in r.stderr), (1, True))
+r = run_add(json.dumps({"password": "pw"}), "site4")
+t("TOTP なしなら、古い門でも成功する", r.returncode, 0)
+GATE_MODE["add_marks_totp"] = True
+for label, bad in (("JSON でない", "not json"), ("オブジェクトでない", "[1, 2]")):
+    full_actions.clear()
+    r = run_add(bad, "site5")
+    t(f"標準入力が{label}なら、終了コード 1 で、門には頼まない",
+      (r.returncode, "JSON にしてください" in r.stderr, [x for x in full_actions if x["type"] == "AddEntry"]), (1, True, []))
+
 shutil.rmtree(W, ignore_errors=True)
 print("結果:", "全部OK" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
