@@ -364,6 +364,54 @@ check(f"親が pid 1 や systemd のときは、共有しない（引き取り�
       gate.parent_of(int(orphan)) is None if adopter == 1 or adopter_comm == "systemd" else None)
 os.kill(int(orphan), 15)
 
+# ===== 接続相手を、接続した時点の姿で固める（要求元が終わって pid が使い回されても、別のプロセスの名前で確認が出ない）=====
+def connect_child(seconds):
+    """gate の代わりに待ち受けて、子プロセスを接続させる。(子, 受け付けた側の接続)"""
+    path = D + "/peer-test.sock"
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)
+    child = subprocess.Popen([sys.executable, "-I", "-c", "import socket,sys,time; s=socket.socket(socket.AF_UNIX); "
+                              "s.connect(sys.argv[1]); time.sleep(float(sys.argv[2]))", path, str(seconds)])
+    conn, _ = srv.accept()
+    srv.close()
+    return child, conn
+
+
+child, conn = connect_child(5)
+peer = gate.peer_of(conn)
+check("生きている相手は、pid・起動時刻・名前・親が、接続した時点の姿で固まる",
+      peer is not None and peer.pid == child.pid and peer.start == gate.start_time(child.pid)
+      and peer.comm == gate.comm_of(child.pid) and peer.parent == (os.getpid(), gate.start_time(os.getpid())))
+child.kill()
+child.wait()
+conn.close()
+
+child, conn = connect_child(0.1)
+for _ in range(100):                    # 終わっているが、まだ回収されていない（/proc は読めるのに、プロセスは終わっている）状態を待つ
+    with open(f"/proc/{child.pid}/stat") as f:
+        st = f.read()
+    if st[st.rindex(")") + 2] == "Z":
+        break
+    time.sleep(0.05)
+check("（試験の前提）終わった相手の /proc は、まだ読める", st[st.rindex(")") + 2] == "Z" and gate.start_time(child.pid) > 0)
+check("読んでいる間に終わっていた相手は、pidfd で分かり、None（同じ pid の別のプロセスと取り違えない）", gate.peer_of(conn) is None)
+child.wait()
+conn.close()
+
+child, conn = connect_child(5)
+saved = gate.SO_PEERPIDFD
+gate.SO_PEERPIDFD, gate._pidfd_warned = 99999, False        # 使えない kernel を真似る
+peer = gate.peer_of(conn)
+gate.SO_PEERPIDFD = saved
+check("SO_PEERPIDFD が使えない kernel でも、相手は固まる（検知できないと、記録に1回だけ書く）",
+      peer is not None and peer.pid == child.pid and sum("SO_PEERPIDFD が使えません" in m for m in logs) == 1)
+child.kill()
+child.wait()
+conn.close()
+
 # ===== GetEntry public（秘密を除いた欄だけ。一覧の確認だけで返り、項目の確認は出ない）=====
 approve()
 n = len(calls)
@@ -535,7 +583,9 @@ check("署名は ssh-sign の確認が出て、鍵の項目名と相手のユー
 check("確認が通れば、署名が上流から返る", r[0] == 14 and ssh_up[-1][0] == 13)
 r = ssh_rt(c, sign_body(BLOB, b"other"))
 check("同じ親・同じ鍵なら、まとめ期間内は聞き直さない", len(polk) == 1 and r[0] == 14)
-gate.parent_of = lambda pid: (999999, 1)
+c.close()
+gate.parent_of = lambda pid: (999999, 1)      # 親は、接続した時点で決まる。別の親のプロセスは、別の接続として来る
+c = sshc()
 r = ssh_rt(c, sign_body(BLOB))
 check("別の親から来た署名は、承認を引き継げず聞き直す", len(polk) == 2 and r[0] == 14)
 n_up = len(ssh_up)

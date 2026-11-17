@@ -69,7 +69,7 @@ your user                                       bwvault (dedicated user, system 
 - **bwvault-agent**: the stock rbw-agent, run as a dedicated user (`ProtectHome`, `ProtectProc`, `CapabilityBoundingSet=` and more;
   3.1 in `systemd-analyze security`). The binaries live in the root-owned `/usr/local/lib/bwvault/`.
 - **bwvault-gate**: the only entrance your user can use (`/run/bwvault-gate/`). It speaks rbw's JSON-lines protocol and decides per request
-  (3.3). The peer's pid and uid come from `SO_PEERCRED`, which the kernel provides.
+  (3.3). The peer's pid and uid come from `SO_PEERCRED`, which the kernel provides. At connect time the gate pins the peer's start time, name and parent, and checks with `SO_PEERPIDFD` (Linux 6.5+) that it read them from the process that connected, so a reused pid is not mistaken for the requester.
 - **Automatic unlock**: the master password is sealed with `systemd-creds` (TPM2 and the host key), and the gate has the agent unlock when it is used.
   `lock_timeout` is 300 seconds (it locks when unused). Unlocking itself reveals nothing, so it needs no confirmation.
 - **Your side**: the `rbw` wrapper (`shim/rbw`) replaces `get`, `code` and `add` with `bwv`, and around `list` and `sync` it refreshes an encrypted copy of the

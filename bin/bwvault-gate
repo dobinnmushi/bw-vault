@@ -31,13 +31,17 @@
 - ExportDb（門独自）: トークンと鍵を除いた項目の写しを返す。あなたの側の rbw の DB（rbw list が読むファイル）に使う。
 
 要求元の pid と uid は、ソケットの接続相手を kernel が教える SO_PEERCRED で得る（偽れない）。許可する uid は
-BWVAULT_ALLOWED_UID の1人だけ。rbw-agent に渡す要求には、あなたの環境変数（画面など）を付けない。
+BWVAULT_ALLOWED_UID の1人だけ。相手は、接続した時点で、pid・起動時刻・名前・親を読んで固める。そのとき、相手のプロセスそのものを指す
+SO_PEERPIDFD（Linux 6.5 以降）で、読んでいる間に相手が終わって、同じ pid が別のプロセスに使われていないかを確かめる
+（使われていたら、確認が別のプロセスの名前で出てしまう）。rbw-agent に渡す要求には、あなたの環境変数（画面など）を付けない。
 """
 import base64
+import collections
 import hashlib
 import json
 import os
 import re
+import select
 import socket
 import socketserver
 import struct
@@ -224,13 +228,47 @@ def start_time(pid):
     return int(s[s.rindex(")") + 2:].split()[19])  # 22 番目の欄 = 起動時刻（clock tick）
 
 
-def describe(pid):
+def comm_of(pid):
+    with open(f"/proc/{pid}/comm") as f:
+        return f.read().strip()
+
+
+SO_PEERPIDFD = 77       # 接続相手のプロセスそのものを指す fd（Linux 6.5 以降。Python の socket には、まだ名前がない）
+Peer = collections.namedtuple("Peer", "pid uid start comm parent")
+_pidfd_warned = False
+
+
+def exited(pidfd):
+    p = select.poll()
+    p.register(pidfd, select.POLLIN)
+    return bool(p.poll(0))
+
+
+def peer_of(sock):
+    """接続相手を、接続した時点の姿で固める。pid だけを覚えておくと、相手が終わって同じ pid が別のプロセスに使われたとき、
+    確認が別のプロセスの名前・起動時刻で出てしまう。読み終えたあとで、相手がまだ生きていることを pidfd で確かめる
+    （読んだ中身は、そのプロセスのものだと言える）。相手がもういなければ None。uid が違う相手は、断るだけなので中身を読まない"""
+    global _pidfd_warned
+    pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    if uid != ALLOWED_UID:
+        return Peer(pid, uid, None, "?", None)
+    pidfd = None
     try:
-        with open(f"/proc/{pid}/comm") as f:
-            comm = f.read().strip()
+        pidfd = int.from_bytes(sock.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD, 4), sys.byteorder, signed=True)
     except OSError:
-        comm = "?"
-    return f"{comm} (pid {pid})"
+        if not _pidfd_warned:
+            _pidfd_warned = True
+            log("SO_PEERPIDFD が使えません（Linux 6.5 より前）。要求元の pid が使い回されたかは、検知できません")
+    try:
+        start, comm, parent = start_time(pid), comm_of(pid), parent_of(pid)
+        if pidfd is not None and exited(pidfd):
+            return None
+    except (OSError, ValueError, IndexError):
+        return None
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+    return Peer(pid, uid, start, comm, parent)
 
 
 _approved = {}          # (pid, 起動時刻, 項目 id) -> 期限
@@ -238,11 +276,10 @@ _approved_lock = threading.Lock()
 _key_locks = {}
 
 
-def authorize(pid, subject, action_id, item_fn, group=None, seconds=None):
-    """このプロセスが subject（項目の id など）について action_id を実行してよいか。承認は subject ごと。
+def authorize(peer, subject, action_id, item_fn, group=None, seconds=None):
+    """この相手（peer_of で固めたもの）が subject（項目の id など）について action_id を実行してよいか。承認は subject ごと。
     同じ subject の再要求だけ、まとめ期間内なら聞かない。item_fn() は確認画面に出す項目名"""
-    start = start_time(pid)
-    gpid, gstart = group or (pid, start)     # 承認を結び付けるプロセス（既定は要求元そのもの）
+    gpid, gstart = group or (peer.pid, peer.start)     # 承認を結び付けるプロセス（既定は要求元そのもの）
     key = (gpid, gstart, action_id, subject)
     with _approved_lock:
         klock = _key_locks.setdefault(key, threading.Lock())
@@ -255,19 +292,20 @@ def authorize(pid, subject, action_id, item_fn, group=None, seconds=None):
             if _approved.get(key, 0) > now:
                 return True
         item = item_fn()
-        ok = polkit_check(pid, start, action_id, {"item": item, "requester": describe(pid)})
+        requester = f"{peer.comm} (pid {peer.pid})"
+        ok = polkit_check(peer.pid, peer.start, action_id, {"item": item, "requester": requester})
         # 記録（journal）は同じユーザーのプログラムからも読めるので、項目名は書かず、対象の短い識別子だけを残す
         tag = hashlib.sha256(str(subject).encode()).hexdigest()[:8]
-        log(f"{'許可' if ok else '拒否'}: {describe(pid)} が [{tag}] を要求（{action_id.rsplit('.', 1)[-1]}）")
+        log(f"{'許可' if ok else '拒否'}: {requester} が [{tag}] を要求（{action_id.rsplit('.', 1)[-1]}）")
         if ok:
             with _approved_lock:
                 _approved[key] = time.monotonic() + (GROUP_SECONDS if seconds is None else seconds)
         return ok
 
 
-def authorize_list(pid):
+def authorize_list(peer):
     """一覧（項目名など）を見せてよいか。承認はプロセスではなくユーザー全体の窓（秘密は出ない）"""
-    return authorize(pid, "list", ACTION_LIST, lambda: "一覧", group=(0, 0), seconds=LIST_SECONDS)
+    return authorize(peer, "list", ACTION_LIST, lambda: "一覧", group=(0, 0), seconds=LIST_SECONDS)
 
 
 # ---- 一覧（rbw list --raw と同じ形）----
@@ -670,7 +708,7 @@ def parent_of(pid):
         return None
 
 
-def ssh_sign_allowed(pid, body):
+def ssh_sign_allowed(peer, body):
     """署名の依頼を通してよいか"""
     try:
         blob, pos = read_string(body, 1)
@@ -688,20 +726,18 @@ def ssh_sign_allowed(pid, body):
     if name is None:
         log("署名を断る: 保管庫にない鍵")
         return False
-    parent = parent_of(pid)
     item = f"{name}（{user} として）" if user else name
-    return authorize(pid, base64.b64encode(blob).decode(), ACTION_SSH, lambda: item,
-                     group=parent, seconds=SSH_GROUP_SECONDS)
+    return authorize(peer, base64.b64encode(blob).decode(), ACTION_SSH, lambda: item,
+                     group=peer.parent, seconds=SSH_GROUP_SECONDS)
 
 
 class SshHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        pid, uid, _gid = struct.unpack("3i", self.request.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-        if uid != ALLOWED_UID:
-            return
         up = None
         try:
+            peer = peer_of(self.request)
+            if peer is None or peer.uid != ALLOWED_UID:
+                return
             while True:
                 body = ssh_recv(self.request)
                 kind = body[0] if body else 0
@@ -709,7 +745,7 @@ class SshHandler(socketserver.BaseRequestHandler):
                     ssh_send(self.request, bytes([SSH_FAILURE]))     # 鍵の追加・削除・ロックなどは受け付けない
                     continue
                 ensure_unlocked()
-                if kind == SSH_SIGN_REQUEST and not ssh_sign_allowed(pid, body):
+                if kind == SSH_SIGN_REQUEST and not ssh_sign_allowed(peer, body):
                     ssh_send(self.request, bytes([SSH_FAILURE]))
                     continue
                 if up is None:
@@ -736,7 +772,7 @@ class SshServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 # ---- 要求の振り分け ----
 
-def handle_request(pid, action):
+def handle_request(peer, action):
     kind = action.get("type")
     if kind in ("Version", "Lock", "Sync"):
         r = agent_call({"type": kind})
@@ -754,7 +790,7 @@ def handle_request(pid, action):
         if kind in ("CheckLock", "Unlock"):
             return {"type": "Ack"}
     if kind == "List":
-        if not authorize_list(pid):
+        if not authorize_list(peer):
             return error("authorization denied")
         try:
             return {"type": "List", "entries": LIST_CACHE.get()}
@@ -771,7 +807,7 @@ def handle_request(pid, action):
         if action.get("public") is True:
             # 秘密を除いた欄だけ（ユーザー名・URI・名前・フォルダ・SSH の公開鍵と指紋）。これらは「一覧の確認」で、すでに見える欄なので、
             # 項目の確認（secret）は要らず、一覧の確認（list）だけ。「ユーザー名だけを入力する」操作で、2回目の確認を出さないため
-            if not authorize_list(pid):
+            if not authorize_list(peer):
                 return error("authorization denied")
             try:
                 return {"type": "Entry", "entry": decrypt_entry(entry, public=True)}
@@ -780,11 +816,11 @@ def handle_request(pid, action):
                 return error(f"could not decrypt the entry: {e}")
         # 承認は「親プロセス＋項目」。rofi-rbw は、1回の操作で rbw get と rbw code（TOTP）を、別のプロセスで続けて起動するので、
         # 同じ親の子が同じ項目を頼むときは、聞き直さない。別の項目は必ず聞き直す。親が分からないときは、プロセスごと
-        if not authorize(pid, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=parent_of(pid)):
+        if not authorize(peer, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry), group=peer.parent):
             return error("authorization denied")
         return {"type": "Entry", "entry": decrypt_entry(entry)}
     if kind == "PasskeyList":
-        if not authorize_list(pid):
+        if not authorize_list(peer):
             return error("authorization denied")
         try:
             return {"type": "Passkeys", "passkeys": PASSKEYS.listing(bool(action.get("force")))}
@@ -799,7 +835,7 @@ def handle_request(pid, action):
             return error("no such passkey")
         m = it["meta"]
         who = m.get("user_name") or m.get("user_display_name") or m.get("item_name") or ""
-        if not authorize(pid, ref, ACTION_SECRET, lambda: f"パスキー {m.get('rp_id')}（{who}）"):
+        if not authorize(peer, ref, ACTION_SECRET, lambda: f"パスキー {m.get('rp_id')}（{who}）"):
             return error("authorization denied")
         try:
             return {"type": "Passkey", **PASSKEYS.secret(ref)}
@@ -809,7 +845,7 @@ def handle_request(pid, action):
     if kind == "AddEntry" and action.get("kind") == "passkey":
         cred = action.get("credential")
         label = (cred.get("rpName") or cred.get("rpId") or "") if isinstance(cred, dict) else ""
-        if not authorize(pid, "passkey:" + str(label), ACTION_WRITE, lambda: f"新規登録（パスキー）: {label}"):
+        if not authorize(peer, "passkey:" + str(label), ACTION_WRITE, lambda: f"新規登録（パスキー）: {label}"):
             return error("authorization denied")
         try:
             add_passkey(action)
@@ -822,7 +858,7 @@ def handle_request(pid, action):
         if not isinstance(name, str):
             return error("bad request")
         what = "SSH 鍵" if action.get("kind") == "ssh" else "ログイン"
-        if not authorize(pid, name, ACTION_WRITE, lambda: f"新規登録（{what}）: {name}"):
+        if not authorize(peer, name, ACTION_WRITE, lambda: f"新規登録（{what}）: {name}"):
             return error("authorization denied")
         try:
             add_entry(action)
@@ -838,7 +874,7 @@ def handle_request(pid, action):
         if cs not in INDEX.free:
             # 秘密は GetEntry だけ。ここでは確認も出さずに断る（確認を無限に出させる嫌がらせも防ぐ）
             return error("secret fields are only available through GetEntry")
-        if not authorize_list(pid):
+        if not authorize_list(peer):
             return error("authorization denied")
         return agent_call({"type": "Decrypt", "cipherstring": cs,
                            "entry_key": action.get("entry_key"), "org_id": action.get("org_id")})
@@ -850,17 +886,19 @@ class Handler(socketserver.StreamRequestHandler):
         self.wfile.write(json.dumps(obj).encode() + b"\n")
 
     def handle(self):
-        pid, uid, _gid = struct.unpack("3i", self.request.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
         try:
-            if uid != ALLOWED_UID:
+            peer = peer_of(self.request)
+            if peer is None:
+                log("要求元は、すでに終了しています")
+                return self.reply(error("requester is gone"))
+            if peer.uid != ALLOWED_UID:
                 return self.reply(error("not allowed"))
             line = self.rfile.readline(1 << 20)
             try:
                 action = json.loads(line)["action"]
             except (ValueError, KeyError, TypeError):
                 return self.reply(error("bad request"))
-            self.reply(handle_request(pid, action))
+            self.reply(handle_request(peer, action))
         except Exception as e:   # 失敗は「拒否」として返す（通してしまわない）
             log(f"error: {type(e).__name__}: {e}")
             try:

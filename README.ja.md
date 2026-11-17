@@ -67,7 +67,7 @@ Linux には、同じユーザーの中でプログラムを区別する権限�
 - **bwvault-agent**：公式の rbw-agent を、専用ユーザーで動かします（`ProtectHome`・`ProtectProc`・`CapabilityBoundingSet=` など。
   `systemd-analyze security` で 3.1）。バイナリは root 所有の `/usr/local/lib/bwvault/` に置きます。
 - **bwvault-gate**：あなたのユーザーが使える唯一の入口（`/run/bwvault-gate/`）。rbw と同じ JSON 行のプロトコルを話し、
-  要求ごとに許可を決めます（3.3）。接続相手の pid と uid は、kernel が教える `SO_PEERCRED` で得ます。
+  要求ごとに許可を決めます（3.3）。接続相手の pid と uid は、kernel が教える `SO_PEERCRED` で得ます。接続した時点で、相手の起動時刻・名前・親を読んで固め、`SO_PEERPIDFD`（Linux 6.5 以降）で、読んだのが接続したプロセスだと確かめます（pid が使い回されても、別のプロセスと取り違えません）。
 - **自動解錠**：マスターパスワードを `systemd-creds`（TPM2 とホスト鍵）で封印し、使われたとき gate が agent を解錠させます。
   `lock_timeout` は 300 秒（使われなければ施錠）。解錠自体は秘密を出さないので、本人確認は要りません。
 - **ユーザー側**：`rbw` のラッパー（`shim/rbw`）が、`get`・`code`・`add` を `bwv` に差し替え、`list`・`sync` の前後に、
