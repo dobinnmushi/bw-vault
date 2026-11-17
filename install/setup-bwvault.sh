@@ -161,14 +161,16 @@ done
 # 4-3. 状態の置き場（bwvault だけが読める）と、rbw の端末の設定
 install -d -m 0700 -o bwvault -g bwvault "$STATE" "$STATE/config" "$STATE/cache" "$STATE/data" "$STATE/data/rbw"
 # 同じ PC なので、いまの rbw の端末 ID を引き継ぐ（Bitwarden への「端末登録」をやり直さずに済ませる）
-if [ ! -e "$STATE/data/rbw/device_id" ] && [ -r "$UHOME/.local/share/rbw/device_id" ]; then
+# （シンボリックリンクは辿らない。root で読むので、ほかのファイルを指させて写させないため）
+if [ ! -e "$STATE/data/rbw/device_id" ] && [ -f "$UHOME/.local/share/rbw/device_id" ] && [ ! -L "$UHOME/.local/share/rbw/device_id" ]; then
   install -m 0600 -o bwvault -g bwvault "$UHOME/.local/share/rbw/device_id" "$STATE/data/rbw/device_id"
 fi
 
 # 4-4. rbw の設定（サービスより先。agent は起動時に config.json を読む）。初回だけ
 # （rbw config set は agent を再起動するので、実行のたびに解錠が外れてしまう）
 if [ ! -e "$STATE/config/rbw/config.json" ]; then
-  EMAIL=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['email'])" "$UHOME/.config/rbw/config.json")
+  # -I: いま居るフォルダ（sudo を実行した、あなたのリポジトリ）や環境変数から、モジュールを読まない（json.py を置かれても動かない）
+  EMAIL=$(python3 -I -c "import json,sys; print(json.load(open(sys.argv[1]))['email'])" "$UHOME/.config/rbw/config.json")
   bwvault-admin config set email "$EMAIL"
   bwvault-admin config set pinentry /usr/bin/pinentry-curses
   bwvault-admin config set lock_timeout 28800

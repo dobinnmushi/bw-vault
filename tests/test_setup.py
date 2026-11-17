@@ -184,6 +184,16 @@ check("yes（後ろに空白）は yes として受理されるが、PAM の確�
 o, c = run(S, ["--bogus"], [], tty=False)
 check("知らない引数は使い方を出して終了コード 2", o, c, 2, ["使い方"])
 
+# root で動くシェルスクリプトの python3 は、-I（いま居るフォルダ・環境変数からモジュールを読まない）で動かす。
+# setup-bwvault.sh は、あなたのリポジトリの中で sudo 実行されるので、-I がないと、そこに置かれた json.py などが root で動く
+bad = []
+for rel in ("install/setup-bwvault.sh", "bin/bwvault-admin"):
+    with open(os.path.join(ROOT, rel)) as f:
+        for n, line in enumerate(f, 1):
+            if re.search(r"\bpython3?\b(?!\s+-I\b)", line.split("#", 1)[0]):
+                bad.append(f"{rel}:{n}")
+check(f"root で動くスクリプトの python3 は、すべて -I つき（違反: {bad}）", "", 0 if not bad else 1, 0, [])
+
 print("結果:", "全部OK" if ok else "失敗あり")
 shutil.rmtree(T, ignore_errors=True)
 sys.exit(0 if ok else 1)
