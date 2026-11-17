@@ -30,6 +30,7 @@
 | `Sync` | – | `Ack` | なし | agent が Bitwarden と同期する |
 | `Login` | – | `Ack` | なし | 互換のため。ログインは bwvault 側で済ませてある |
 | `ExportDb` | – | `Db`（`db`: 暗号化された項目の写し） | なし | トークン・保護された鍵は **含まれない**（`null`）。`rbw list` が読む DB の形 |
+| `List` | – | `List`（`entries`） | **`list`** | 一覧を**1回の要求**で返す。`rbw list --raw` と同じ形（`id` `name` `user` `folder` `uris` `type`。名前順）。門が復号して、保管庫が変わる（DB の更新・`Lock`）まで覚えているので、2回目以降は速い（483 件で、項目ごとの復号を往復する約 0.6 秒が、ほぼ 0 になる） |
 | `Decrypt` | `cipherstring`, `entry_key`, `org_id` | `Decrypt`（`plaintext`） | **`list`** | **項目名・ユーザー名・URI・フォルダ名の暗号文だけ**。秘密の欄は `Error`（`secret fields are only available through GetEntry`）。未知の暗号文も同じ |
 | `GetEntry` | `id` | `Entry`（`entry`） | **`secret`**（項目ごと） | `rbw get --raw` と同じ形（下記） |
 | `PasskeyList` | `force`（任意） | `Passkeys`（`passkeys`） | **`list`** | 秘密鍵は **含まれない**。gate が 10 分覚えている。`force` は、10 秒より古ければ取り直す |
@@ -85,5 +86,5 @@ Identity: 17 の欄（`title` … `username`）、SshKey: `public_key` `fingerpr
 
 - 確認（指紋・パスワード）は、gate が行う。**クライアントで本人確認を重ねない**。
 - 秘密を取ったら、使ったあとすぐ捨てる。ログ・通知・ファイルに書かない（gate の記録にも、項目名や秘密は書いていない）。
-- 一覧は、`ExportDb`（暗号化された写し。確認なし）と `Decrypt`（`list` の確認）の組み合わせで作る。`bwv-pull` と `rbw list` が参照実装。
+- 一覧は `List` で取る（1回の要求）。`List` を知らない古い gate は `Error`（`List is not allowed`）を返すので、そのときだけ、従来の `ExportDb` の写し＋ `Decrypt`（`list` の確認）の組み合わせに戻る（`bin/bwv` の `list_entries` が参照実装）。
 - gate がなければ（ソケットがなければ）、従来の経路に戻る。

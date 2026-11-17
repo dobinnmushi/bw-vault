@@ -3,6 +3,22 @@
 Bitwarden（[rbw](https://github.com/doy/rbw)）の保管庫の鍵を、**自分のユーザーとは別のユーザー `bwvault`** に置き、
 秘密を出す前に **polkit（sudo と同じ認証：指紋、だめならパスワード）で本人確認**をする仕組みです。
 
+## 3つの部品
+
+Bitwarden を Linux のデスクトップ（GNOME / Wayland）で、パスワードの入力・パスキー・SSH まで使えるようにする、3つのリポジトリの1つです。
+bw-vault は、その**認証の部分**で、残りの2つは、それぞれ単独でも動きます。
+
+| リポジトリ | 役割 | bw-vault がないとき |
+|---|---|---|
+| **bw-vault**（これ） | 保管庫の鍵を別ユーザーに置き、秘密を出す前に polkit で確認する門。SSH エージェントも兼ねる | – |
+| [bw-autotype](https://github.com/dobinnmushi/bw-autotype) | ホットキーで、ユーザー名・パスワード・TOTP を任意のアプリに入力。新規登録 | 単独で動く（自前で指紋を確認） |
+| [bw-passkey](https://github.com/dobinnmushi/bw-passkey) | 保管庫のパスキーを使う、仮想の FIDO2 セキュリティキー | 単独で動く（自前で指紋を確認） |
+
+一緒に使うと、入力・パスキー・SSH の**すべてが、同じ門と、同じ確認**（指紋、だめならパスワード）を通ります。
+bw-autotype と bw-passkey は、bw-vault のソケットがあれば自動で門を使い、なければ従来のまま動きます。
+導入は、bw-vault（下の「導入」）→ bw-autotype・bw-passkey（それぞれの README）の順です。
+門との約束事は [`docs/protocol.md`](docs/protocol.md) に書いてあり、別のクライアントも作れます。
+
 ## なぜ要るか
 
 rbw-agent は、解錠すると保管庫の鍵をメモリに持ち、**同じユーザーで動くどのプログラムの「復号して」にも応えます**。
@@ -94,7 +110,8 @@ bw-passkey は、gate のソケットがあれば自動で gate を使います�
 | 手で施錠・解錠・同期 | `sudo bwvault-admin lock` / `unlock` / `sync` |
 | マスターパスワードを変えた | `sudo bwvault-admin seal-master` をやり直す |
 | 確認の窓の長さを変える | `/etc/bwvault/gate.env` に `BWVAULT_LIST_SECONDS` `BWVAULT_GROUP_SECONDS` `BWVAULT_SSH_GROUP_SECONDS` を書き、`sudo systemctl restart bwvault-gate` |
-| gate を更新した | まず `bash install/setup-bwvault.sh --check`（root 不要。システムの版との差分だけを表示）。読んでから `sudo bash install/setup-bwvault.sh`（差分を表示し、`yes` の入力を求める。置き済みの本物の rbw は上書きしません） |
+| 一覧が遅い | 一覧（`rbw list --raw`）は、門が復号して覚えているので、2回目以降は速い。遅いときは、`systemctl status bwvault-gate` で、起動し直されていないかを見る（更新や再起動の直後の1回目は、復号し直す） |
+| gate を更新した | まず `bash install/setup-bwvault.sh --check`（root 不要。システムの版との差分だけを表示）。読んでから `sudo bash install/setup-bwvault.sh`（差分と、何を再起動するかを表示し、`yes` の入力を求める。再起動するのは、gate 本体・gate の unit が変わったときの gate だけで、agent は再起動しません（解錠が外れるため）。置き済みの本物の rbw は上書きしません） |
 | rbw を更新した | 新しい `rbw`・`rbw-agent` を、`sudo install -m 0755 … /usr/local/lib/bwvault/` で置き直す |
 | ファームウェア更新などで解錠できなくなった | `sudo bwvault-admin seal-master`（TPM の PCR には結び付けていません） |
 

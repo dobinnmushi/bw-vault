@@ -103,8 +103,23 @@ for name in "${RBW_NEEDS[@]}"; do
   else echo "  新規  $LIB/$name   ${RBW_SRC[$name]} から ※控えのハッシュと違います: $got"; RBW_MISMATCH=true; fi
 done
 
+# 何を再起動するか。gate 本体と gate の unit が変わったときだけ gate を再起動する（polkit の定義・PAM・bwvault-admin は、再起動なしで次から有効）。
+# agent は、再起動すると解錠が外れるので、このスクリプトからは再起動しない
+RESTART_GATE=false
+AGENT_UNIT_CHANGED=false
+for i in "${changed[@]}"; do
+  case "${PLAN[$i]#*|}" in
+    "$LIB/bwvault-gate"|/etc/systemd/system/bwvault-gate.service) RESTART_GATE=true ;;
+    /etc/systemd/system/bwvault-agent.service) AGENT_UNIT_CHANGED=true ;;
+  esac
+done
 if [ "${#changed[@]}" -eq 0 ] && [ "${#RBW_NEEDS[@]}" -eq 0 ]; then
   echo "変更はありません。"
+else
+  echo "== 反映のしかた =="
+  if $RESTART_GATE; then echo "  bwvault-gate を再起動します（agent は再起動しないので、解錠は外れません）"
+  else echo "  サービスの再起動は要りません（polkit の定義・PAM・bwvault-admin は、次に使われるときから有効です）"; fi
+  if $AGENT_UNIT_CHANGED; then echo "  bwvault-agent の unit が変わります。反映には再起動が要ります（解錠が外れます。このスクリプトは再起動しません。次に使われるとき、自動で解錠されます）"; fi
 fi
 if [ "$MODE" = check ]; then
   [ "${#changed[@]}" -eq 0 ] && [ "${#RBW_NEEDS[@]}" -eq 0 ] && exit 0 || exit 1
@@ -165,11 +180,10 @@ echo "BWVAULT_ALLOWED_UID=$(id -u "$SUDO_USER")" > /etc/bwvault/gate.env
 systemctl daemon-reload
 systemctl enable --now bwvault-agent.service
 systemctl enable --now bwvault-gate.service
-[ "${#changed[@]}" -eq 0 ] || systemctl restart bwvault-gate.service
-for i in "${changed[@]}"; do
-  [ "${PLAN[$i]#*|}" != /etc/systemd/system/bwvault-agent.service ] \
-    || echo "注意: agent の unit が変わりました。反映するには sudo systemctl restart bwvault-agent（解錠が外れます。次に使うとき、自動で解錠されます）"
-done
+if $RESTART_GATE; then systemctl restart bwvault-gate.service; fi
+if $AGENT_UNIT_CHANGED; then
+  echo "注意: agent の unit が変わりました。反映するには sudo systemctl restart bwvault-agent（解錠が外れます。次に使うとき、自動で解錠されます）"
+fi
 
 echo
 if [ -e /etc/bwvault/master.cred ]; then

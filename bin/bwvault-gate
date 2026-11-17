@@ -10,6 +10,8 @@
 - それ以外の復号（パスワード・TOTP・ノート・カード・SSH 秘密鍵・隠しフィールド・履歴）: Decrypt では通さない。
   許可する暗号文は「門が自分の DB から集めた、項目名などの暗号文」の許可リストで決める。リストにないものは秘密として扱う。
   標準の rbw get は、探す段階で全項目のノートを復号するので、項目ごとの確認と両立しない。
+- List（門独自）: 一覧（rbw list --raw と同じ形）を1回の要求で返す。復号した一覧は、保管庫が変わる（DB が変わる・Lock）まで門の中で覚える。
+  確認は list（Decrypt と同じ窓）。一覧を、項目ごとの復号の往復（数百回）でやらずに済ませるため。
 - GetEntry（門独自）: 項目の ID を指定して、その項目の全欄を復号して返す（rbw get --raw と同じ形）。
   polkit の確認は「プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。
   同じプロセスが同じ項目をもう一度頼むときだけ、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
@@ -261,6 +263,65 @@ def authorize(pid, subject, action_id, item_fn, group=None, seconds=None):
 def authorize_list(pid):
     """一覧（項目名など）を見せてよいか。承認はプロセスではなくユーザー全体の窓（秘密は出ない）"""
     return authorize(pid, "list", ACTION_LIST, lambda: "一覧", group=(0, 0), seconds=LIST_SECONDS)
+
+
+# ---- 一覧（rbw list --raw と同じ形）----
+
+ENTRY_TYPES = {"Login": "Login", "Card": "Card", "Identity": "Identity", "SshKey": "SSH Key"}
+
+
+class ListCache:
+    """復号した一覧。DB が変わる（同期）か、Lock されるまで覚える"""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stamp, self.entries = None, None
+
+    def clear(self):
+        with self.lock:
+            self.stamp, self.entries = None, None
+
+    def get(self):
+        INDEX.refresh()
+        with self.lock:
+            if self.entries is not None and self.stamp == INDEX.stamp:
+                return self.entries
+            stamp, entries = INDEX.stamp, self._build()
+            self.stamp, self.entries = stamp, entries
+            return entries
+
+    @staticmethod
+    def _build():
+        def dec(cs, key, org):
+            r = agent_call({"type": "Decrypt", "cipherstring": cs, "entry_key": key, "org_id": org})
+            if r.get("type") != "Decrypt":
+                raise RuntimeError(r.get("error", "decrypt failed"))
+            return r["plaintext"]
+
+        def soft(cs, key, org):          # rbw は、ユーザー名・URI の復号に失敗しても、None にして続ける
+            try:
+                return dec(cs, key, org) if cs else None
+            except RuntimeError:
+                return None
+
+        out = []
+        for e in INDEX.db.get("entries", []):
+            key, org = e.get("key"), e.get("org_id")
+            d = e.get("data")
+            kind = next((k for k in ("Login", "Card", "Identity", "SshKey") if isinstance(d, dict) and k in d), None)
+            login = d["Login"] if kind == "Login" else None
+            out.append({
+                "id": e["id"],
+                "name": dec(e["name"], key, org),
+                "user": soft(login.get("username"), key, org) if login else None,
+                "folder": dec(e["folder"], None, None) if e.get("folder") else None,   # フォルダ名は、項目の鍵ではなく個人の鍵で復号する
+                "uris": [u for u in (soft(x.get("uri"), key, org) for x in login.get("uris") or []) if u is not None] if login else None,
+                "type": ENTRY_TYPES.get(kind, "Note"),
+            })
+        out.sort(key=lambda x: x["name"].encode())
+        return out
+
+
+LIST_CACHE = ListCache()
 
 
 # ---- 項目の取り出し（rbw get --raw と同じ形の JSON）----
@@ -662,10 +723,13 @@ class SshServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 def handle_request(pid, action):
     kind = action.get("type")
     if kind in ("Version", "Lock", "Sync"):
-        return agent_call({"type": kind})
+        r = agent_call({"type": kind})
+        if kind == "Lock":
+            LIST_CACHE.clear()          # 施錠したら、覚えている一覧も捨てる
+        return r
     if kind == "Login":
         return {"type": "Ack"}      # ログインは bwvault 側で済ませてある
-    if kind in ("CheckLock", "Unlock", "GetEntry", "Decrypt", "AddEntry", "PasskeyList", "PasskeyGet"):
+    if kind in ("CheckLock", "Unlock", "GetEntry", "Decrypt", "AddEntry", "PasskeyList", "PasskeyGet", "List"):
         try:
             ensure_unlocked()
         except Exception as e:
@@ -673,6 +737,14 @@ def handle_request(pid, action):
             return error("bwvault is locked and could not be unlocked (sudo bwvault-admin seal-master, journalctl -u bwvault-gate)")
         if kind in ("CheckLock", "Unlock"):
             return {"type": "Ack"}
+    if kind == "List":
+        if not authorize_list(pid):
+            return error("authorization denied")
+        try:
+            return {"type": "List", "entries": LIST_CACHE.get()}
+        except (RuntimeError, OSError, KeyError) as e:
+            log(f"一覧の作成に失敗: {type(e).__name__}: {e}")
+            return error(f"could not build the list: {e}")
     if kind == "ExportDb":
         return {"type": "Db", "db": INDEX.export()}
     if kind == "GetEntry":

@@ -3,15 +3,19 @@
 
 - 既定のプロファイルを vault にする（RBW_PROFILE が指定済みならそれに従う）。実体は root 所有の /usr/local/lib/bwvault/rbw。
 - get は bwv get に差し替える（秘密の取り出しは、項目ごとの本人確認がある門の GetEntry だけ）。
-- list・sync の前後に、門から暗号化された項目の写しを取り直す（bwv-pull。rbw list が読む DB を最新にする）。
+- `list --raw` は、rbw に渡さず、門に1回の要求で頼む（門が復号した一覧を、保管庫が変わるまで覚えている）。
+  それ以外の list・sync は、前後に、門から暗号化された項目の写しを取り直す（bwv-pull。rbw list が読む DB を最新にする）。
 - add は bwv add に差し替える（暗号化と送信は門が行い、本人確認がある）。edit・remove は、まだ使えない。
 - code は bwv code に差し替える（TOTP のコードは、本人確認のあと、手元で計算する）。
 - search は、全項目のノートを復号して探すので、使えない。
 それ以外はそのまま実体に渡す。
 """
+import importlib.machinery
+import json
 import os
 import subprocess
 import sys
+import types
 
 REAL = os.environ.get("BWV_REAL_RBW", "/usr/local/lib/bwvault/rbw")
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
@@ -20,6 +24,7 @@ PULL, BWV = os.path.join(BIN, "bwv-pull"), os.path.join(BIN, "bwv")
 os.environ.setdefault("RBW_PROFILE", "vault")
 args = sys.argv[1:]
 sub = args[0] if args else ""
+GATE_SOCK = os.environ.get("BWVAULT_GATE_SOCKET", "/run/bwvault-gate/gate.sock")
 
 
 def die(msg):
@@ -27,18 +32,40 @@ def die(msg):
     sys.exit(1)
 
 
+def ensure_ready():
+    """ユーザー側の設定と、ソケットのリンク（$XDG_RUNTIME_DIR/rbw-<プロファイル>/socket → 門）を整える。
+    すでに整っていれば何もしない（毎回 Python をもう1つ起動しないため、先に自分で確かめる）"""
+    profile = "rbw-" + os.environ["RBW_PROFILE"]
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    config = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), profile, "config.json")
+    link = os.path.join(runtime, profile, "socket")
+    ok = os.path.islink(link) and os.readlink(link) == GATE_SOCK and os.path.exists(config)
+    if not ok:
+        subprocess.run([PULL, "--init-only"])
+
+
 if sub == "get":
     os.execv(BWV, [BWV, "get", *args[1:]])
 if sub == "code":
     os.execv(BWV, [BWV, "code", *args[1:]])
-if sub == "search":
-    die("search は、全項目のノートを復号して探すため、使えません / 'search' is not available (it would decrypt the notes of every item)")
 if sub == "add":
     os.execv(BWV, [BWV, "add", *args[1:]])
+if sub == "search":
+    die("search は、全項目のノートを復号して探すため、使えません / 'search' is not available (it would decrypt the notes of every item)")
 if sub in ("edit", "remove", "rm"):
     die(f"{sub} は、まだ bwvault に対応していません / '{sub}' is not supported by bwvault yet")
 
-subprocess.run([PULL, "--init-only"])
+if args == ["list", "--raw"]:
+    # いちばんよく呼ばれる形。門が復号した一覧を、1回の要求で受け取る（rbw に渡さない。写しの更新も要らない）
+    loader = importlib.machinery.SourceFileLoader("bwv", BWV)
+    bwv = types.ModuleType("bwv")
+    bwv.__file__ = BWV                  # bwv は、自分の場所（__file__）から bwv-pull を探す
+    loader.exec_module(bwv)
+    json.dump(bwv.list_entries(), sys.stdout, ensure_ascii=False)
+    print()
+    sys.exit(0)
+
+ensure_ready()
 if sub == "sync":
     rc = subprocess.run([REAL, *args]).returncode
     if rc == 0:

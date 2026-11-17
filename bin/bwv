@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """bwv: bwvault の門から項目の秘密を取り出す。`rbw get` の代わり（vault プロファイル用）。
 
+  bwv list --raw                                       項目の一覧（rbw list --raw と同じ形の JSON。門が1回の要求で返す）
   bwv get [--raw] [-i] [--folder F] 名前または UUID [ユーザー名]
   bwv code [-i] [--folder F] 名前または UUID [ユーザー名]   TOTP のコード（rofi-rbw が rbw code で呼ぶ）
   bwv add [--uri U] [--folder F] 名前 [ユーザー名]    標準入力の1行目がパスワード、残りがノート（rbw add と同じ）
   bwv add --ssh [--folder F] 名前                      標準入力は JSON {"private_key","public_key","fingerprint"}
 
 項目の探し方は rbw get と同じ（名前が完全一致 → 部分一致の順、ユーザー名・フォルダで絞る）。ただし探すのは
-`rbw list --raw`（項目名・ユーザー名・フォルダ・URI。確認不要の欄）だけで行い、見つけた項目の ID を門に渡す。
+一覧（項目名・ユーザー名・フォルダ・URI。「一覧」の確認 1 回）だけで行い、見つけた項目の ID を門に渡す。
 門が、その項目の名前を出した本人確認（指紋・パスワード）をしてから、その項目の全欄を返す。
 --raw は rbw get --raw と同じ JSON、なしはパスワード（カードは番号）だけを出す。
 """
@@ -26,7 +27,7 @@ import urllib.parse
 import uuid
 
 GATE_SOCK = os.environ.get("BWVAULT_GATE_SOCKET", "/run/bwvault-gate/gate.sock")
-RBW = os.environ.get("BWV_RBW", "rbw")
+RBW = os.environ.get("BWV_RBW", "/usr/local/lib/bwvault/rbw")      # 実体の rbw（PATH 上の rbw は、これを呼ぶラッパーなので、使わない）
 
 
 def die(msg, code=1):
@@ -34,13 +35,28 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def list_entries():
+def list_entries_via_rbw():
+    """従来の経路（rbw list --raw。項目ごとの復号の往復で、遅い）。List を知らない古い門のときだけ使う"""
     env = dict(os.environ)
     env.setdefault("RBW_PROFILE", "vault")
+    subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "bwv-pull")], env=env)   # 実体の rbw が読む写しを、最新にする
     r = subprocess.run([RBW, "list", "--raw"], capture_output=True, text=True, env=env)
     if r.returncode != 0:
         die(f"rbw list に失敗しました: {r.stderr.strip()}")
     return json.loads(r.stdout)
+
+
+def list_entries():
+    """項目の一覧（id・name・user・folder・uris・type）。門が復号して1回の要求で返す（門の中で覚えているので、2回目以降は速い）"""
+    try:
+        res = gate_call({"type": "List"})
+    except (OSError, ValueError) as e:
+        die(f"門につながりません: {e}")
+    if res.get("type") == "List":
+        return res["entries"]
+    if "is not allowed" in str(res.get("error", "")):
+        return list_entries_via_rbw()
+    die(res.get("error", str(res)))
 
 
 def matcher(ignore_case, exact):
@@ -186,6 +202,8 @@ def main():
     c.add_argument("user", nargs="?")
     c.add_argument("--folder")
     c.add_argument("-i", "--ignore-case", action="store_true")
+    l = sub.add_parser("list")
+    l.add_argument("--raw", action="store_true", required=True)
     ad = sub.add_parser("add")
     ad.add_argument("name")
     ad.add_argument("user", nargs="?")
@@ -195,6 +213,10 @@ def main():
     a = ap.parse_args()
     if a.cmd == "add":
         return cmd_add(a)
+    if a.cmd == "list":
+        json.dump(list_entries(), sys.stdout, ensure_ascii=False)
+        print()
+        return
 
     try:
         needle = ("uuid", str(uuid.UUID(a.needle))) if len(a.needle) == 36 else ("name", a.needle)

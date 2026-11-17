@@ -58,5 +58,64 @@ def raises(f):
     except ValueError: return True
 t("対応しない形式（steam://）は ValueError", raises(lambda: bwv.totp_code("steam://ABCDEFGH")), True)
 t("対応しないアルゴリズムは ValueError", raises(lambda: bwv.totp_code(f"otpauth://totp/x?secret={b32(sec1)}&algorithm=MD5")), True)
+
+t("従来の経路が呼ぶ rbw の既定値は、PATH 上のラッパーではなく、実体の絶対パス（呼び合いの無限ループを防ぐ）",
+  (os.path.isabs(bwv.RBW), bwv.RBW != "rbw"), (True, True))
+
+# --- ラッパー経由の rbw list --raw（偽の gate）。新しい gate は速い経路、古い gate は従来の経路に戻り、無限に呼び合わない
+import json, shutil, socketserver, subprocess, tempfile, threading
+SHIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shim", "rbw")
+W = tempfile.mkdtemp(prefix="bwv-shim-test-")
+os.makedirs(W + "/bin")
+os.symlink(os.path.realpath(SHIM), W + "/bin/rbw")                      # PATH 上の rbw は、ラッパー
+open(W + "/real-rbw", "w").write('#!/bin/sh\necho "$@" >> %s/real.log\necho \'[{"id":"old","name":"from-real-rbw","user":null,"folder":null,"uris":[],"type":"Note"}]\'\n' % W)
+os.chmod(W + "/real-rbw", 0o755)
+GATE_MODE = {"list": True}
+seen_actions = []
+ENTRIES = [{"id": "1", "name": "a", "user": "u", "folder": None, "uris": ["https://a.example"], "type": "Login"}]
+
+
+class FakeGate(socketserver.StreamRequestHandler):
+    def handle(self):
+        a = json.loads(self.rfile.readline())["action"]
+        seen_actions.append(a["type"])
+        if a["type"] == "List" and GATE_MODE["list"]:
+            r = {"type": "List", "entries": ENTRIES}
+        else:
+            r = {"type": "Error", "error": f"{a['type']} is not allowed"}
+        self.wfile.write(json.dumps(r).encode() + b"\n")
+
+
+class Srv(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+threading.Thread(target=Srv(W + "/gate.sock", FakeGate).serve_forever, daemon=True).start()
+env = dict(os.environ, PATH=W + "/bin:" + os.environ["PATH"], BWVAULT_GATE_SOCKET=W + "/gate.sock", BWV_REAL_RBW=W + "/real-rbw",
+           BWV_RBW=W + "/real-rbw", XDG_RUNTIME_DIR=W + "/run", XDG_CONFIG_HOME=W + "/cfg", XDG_CACHE_HOME=W + "/cache", HOME=W)
+for d in ("run", "cfg", "cache"):
+    os.makedirs(W + "/" + d, exist_ok=True)
+
+
+def run_rbw(*args):
+    try:
+        r = subprocess.run(["rbw", *args], env=env, capture_output=True, text=True, timeout=15)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT", "", ""
+
+
+code, out, err = run_rbw("list", "--raw")
+t("新しい gate: rbw list --raw は、門の List の結果を返し、実体の rbw を呼ばない",
+  (code, json.loads(out) == ENTRIES, "List" in seen_actions, os.path.exists(W + "/real.log")), (0, True, True, False))
+GATE_MODE["list"] = False
+seen_actions.clear()
+code, out, err = run_rbw("list", "--raw")
+t("古い gate（List を知らない）: 従来の経路に戻り、固まらずに終わる（無限に呼び合わない）",
+  (code, "from-real-rbw" in out), (0, True))
+if code != 0: print("      stderr:", err[-400:].replace("\n", " | "))
+t("古い gate: 実体の rbw は、ちょうど1回だけ呼ばれる", open(W + "/real.log").read().count("list --raw"), 1)
+t("古い gate: 門への List の問い合わせは、1回だけ", seen_actions.count("List"), 1)
+shutil.rmtree(W, ignore_errors=True)
 print("結果:", "全部OK" if ok else "失敗あり")
 sys.exit(0 if ok else 1)

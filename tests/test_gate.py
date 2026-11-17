@@ -224,6 +224,42 @@ db = ask({"type": "ExportDb"})["db"]
 check("ExportDb にトークン・保護された鍵がない", all(db[k] is None for k in ("access_token", "refresh_token", "protected_key", "protected_private_key"))
       and "SECRET" not in json.dumps(db) and len(db["entries"]) == 3)
 
+
+# ===== List（一覧を1回の要求で返す。復号した一覧は、保管庫が変わるまで覚える）=====
+approve()
+gate.LIST_CACHE.clear()
+n = len(calls)
+r = ask({"type": "List"})
+want = [
+    {"id": "e2", "name": "PT:2.name2|a|b", "user": None, "folder": None, "uris": None, "type": "Note"},
+    {"id": "e1", "name": "PT:2.name|a|b", "user": "PT:2.user|a|b", "folder": "PT:2.folder|a|b", "uris": ["PT:2.uri|a|b"], "type": "Login"},
+    {"id": "e3", "name": "PT:2.sshname|a|b", "user": None, "folder": None, "uris": None, "type": "SSH Key"},
+]
+check("List は一覧の確認（list）を通して、rbw list --raw と同じ形で返す（名前順）", r.get("type") == "List" and r["entries"] == want and polk == [(LIST, "一覧")])
+check("List が復号するのは、項目名・ユーザー名・URI・フォルダ名だけ（秘密は復号しない）",
+      all(c in ("2.name|a|b", "2.name2|a|b", "2.sshname|a|b", "2.user|a|b", "2.uri|a|b", "2.folder|a|b") for c in dcalls(n)))
+n = len(calls)
+r2 = ask({"type": "List"})
+check("2回目は、復号をやり直さない（門の中で覚えている）。確認も、窓の間は聞かない", r2["entries"] == want and dcalls(n) == [] and len(polk) == 1)
+ask({"type": "Lock"})
+STATE["locked"] = False        # 偽の agent は Lock で施錠される。自動解錠で戻る
+n = len(calls)
+ask({"type": "List"})
+check("Lock のあとは、覚えていた一覧を捨てて、復号し直す", len(dcalls(n)) > 0)
+n = len(calls)
+db_path = D + "/db/default:x@example.com.json"
+text = open(db_path).read()
+time.sleep(0.01)
+open(db_path, "w").write(text)           # DB が書き換わった（同期）
+ask({"type": "List"})
+check("DB が変わった（同期した）あとは、復号し直す", len(dcalls(n)) > 0)
+approve(False)
+gate.LIST_CACHE.clear()
+n = len(calls)
+r = ask({"type": "List"})
+check("一覧の確認が通らなければ、List は断られ、項目名は復号されない", r.get("type") == "Error" and dcalls(n) == [])
+approve()
+
 # ===== 秘密は Decrypt では出ない =====
 approve()
 n = len(calls)
