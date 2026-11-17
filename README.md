@@ -84,6 +84,7 @@ your user                                       bwvault (dedicated user, system 
 | `…bwvault.write` | Creating an item or a passkey | The kind and name of the new entry, and the requester | Process + name, 10 seconds |
 | `…bwvault.ssh-sign` | An SSH signature | The key's item name and the username being logged in as | **Parent process + key**, 30 seconds (`git push` may start ssh several times; they are children of the same git) |
 
+Approvals bound to the parent process fall back to per-process when the parent is systemd (the user service manager) or pid 1; their children never share one.
 You get 5 fingerprint attempts, then the password (`pam/polkit-1`; sudo and login are not changed).
 Binding approvals to an item is deliberate: the item name in the dialog lets you spot a request aimed at a different item.
 

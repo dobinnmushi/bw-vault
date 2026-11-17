@@ -338,6 +338,18 @@ ask_child({"type": "GetEntry", "id": "e1"})
 ask_child({"type": "GetEntry", "id": "e1"})
 check("親が分からないときは、プロセスごとに聞く（引き継がない）", len(asked(SECRET)) == 2)
 gate.parent_of = orig_parent
+check("ふつうの親（この試験を動かしているプロセス）は、承認を共有する親として返る",
+      gate.parent_of(os.getpid()) == (os.getppid(), gate.start_time(os.getppid())))
+# 親を失ったプロセスは、pid 1 か systemd（ユーザーのサービス管理）に引き取られる。そこの子どうしで承認を共有しない
+orphan = subprocess.run(["sh", "-c", "sleep 5 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip()
+time.sleep(0.2)
+with open(f"/proc/{orphan}/stat") as f:
+    adopter = int(f.read().rsplit(")", 1)[1].split()[1])
+with open(f"/proc/{adopter}/comm") as f:
+    adopter_comm = f.read().strip()
+check(f"親が pid 1 や systemd のときは、共有しない（引き取り手: {adopter_comm}）",
+      gate.parent_of(int(orphan)) is None if adopter == 1 or adopter_comm == "systemd" else None)
+os.kill(int(orphan), 15)
 
 # ===== GetEntry public（秘密を除いた欄だけ。一覧の確認だけで返り、項目の確認は出ない）=====
 approve()

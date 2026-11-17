@@ -651,11 +651,17 @@ SSH_KEYS = SshKeys()
 
 
 def parent_of(pid):
-    """(親 pid, 親の起動時刻)。読めなければ None"""
+    """(親 pid, 親の起動時刻)。読めなければ None。
+    親が pid 1 や systemd（ユーザーのサービス管理）のときも None（プロセスごとに聞く）。そこの子は、ユーザーのサービスや、
+    親を失って引き取られたプロセスすべてなので、承認を共有すると広すぎる"""
     try:
         with open(f"/proc/{pid}/stat") as f:
             st = f.read()
         ppid = int(st[st.rindex(")") + 2:].split()[1])
+        with open(f"/proc/{ppid}/comm") as f:
+            comm = f.read().strip()
+        if ppid <= 1 or comm == "systemd":
+            return None
         return ppid, start_time(ppid)
     except (OSError, ValueError, IndexError):
         return None
