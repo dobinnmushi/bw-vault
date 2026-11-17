@@ -22,7 +22,7 @@
 - AddEntry（門独自）: ログイン項目か SSH 鍵項目を新規に作る。暗号化は agent に頼み、Bitwarden の API へは門が送る
   （アクセストークンは bwvault の DB にしかない）。polkit の確認（write）を通ってから行う。
 - PasskeyList / PasskeyGet / AddEntry(kind=passkey)（門独自。bw-passkey 用）: パスキーの一覧（サイト名・ユーザー名・credentialId など。
-  秘密鍵を含まない）は確認なしで返し、秘密鍵は PasskeyGet でパスキー1つごとに polkit の確認を通してから返す。
+  秘密鍵を含まない）は一覧の確認（list。項目の一覧と同じ窓）で返し、秘密鍵は PasskeyGet でパスキー1つごとに polkit の確認を通してから返す。
   保管庫の生のデータ（/sync）は、トークンを持つ門が取る。
 - SSH エージェント（SSH_AUTH_SOCK がここを指す）: 鍵の一覧は通し、署名は polkit の確認（ssh-sign）を通してから agent に渡す。
   確認画面には鍵の項目名と、入ろうとしているユーザー名を出す。承認は「親プロセス＋鍵」ごとに SSH_GROUP_SECONDS 秒
@@ -172,6 +172,7 @@ class Index:
                         owner[s] = e
             self.by_id = {e.get("id"): e for e in db.get("entries", [])}
             self.db, self.free, self.owner, self.stamp = db, free, owner, stamp
+            self.names = {}      # 名前が変わっていることがあるので、確認画面に出す名前も復号し直す
 
     def export(self):
         """トークンと鍵を除いた写し（暗号化された項目だけ）"""
@@ -188,7 +189,9 @@ class Index:
         if eid not in self.names:
             r = agent_call({"type": "Decrypt", "cipherstring": entry["name"],
                             "entry_key": entry.get("key"), "org_id": entry.get("org_id")})
-            self.names[eid] = r.get("plaintext") if r.get("type") == "Decrypt" else "(名前を復号できません)"
+            if r.get("type") != "Decrypt":
+                return "(名前を復号できません)"      # 覚えない（次は復号し直す）
+            self.names[eid] = r["plaintext"]
         return self.names[eid]
 
 

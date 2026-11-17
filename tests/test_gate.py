@@ -338,6 +338,19 @@ ask_child({"type": "GetEntry", "id": "e1"})
 ask_child({"type": "GetEntry", "id": "e1"})
 check("親が分からないときは、プロセスごとに聞く（引き継がない）", len(asked(SECRET)) == 2)
 gate.parent_of = orig_parent
+# 確認画面の項目名は、保管庫で名前が変わったら、新しい名前を出す（古い名前を覚えたままにしない）
+DBF = D + "/db/default:x@example.com.json"
+approve()
+ask({"type": "GetEntry", "id": "e2"})
+renamed = dict(e2, name="2.renamed-item|a|b")
+json.dump({"access_token": "SECRET-TOKEN", "refresh_token": "SECRET-R", "protected_key": "2.pk|a|b", "protected_org_keys": {},
+           "entries": [e1, renamed, e3]}, open(DBF, "w"))
+approve()
+ask({"type": "GetEntry", "id": "e2"})
+check("項目の名前が変わったら、確認画面にも新しい名前を出す", asked(SECRET) == [(SECRET, "PT:2.renamed-item|a|b")])
+json.dump({"access_token": "SECRET-TOKEN", "refresh_token": "SECRET-R", "protected_key": "2.pk|a|b", "protected_org_keys": {},
+           "entries": [e1, e2, e3]}, open(DBF, "w"))
+approve()
 check("ふつうの親（この試験を動かしているプロセス）は、承認を共有する親として返る",
       gate.parent_of(os.getpid()) == (os.getppid(), gate.start_time(os.getppid())))
 # 親を失ったプロセスは、pid 1 か systemd（ユーザーのサービス管理）に引き取られる。そこの子どうしで承認を共有しない
