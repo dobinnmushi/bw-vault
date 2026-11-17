@@ -21,6 +21,7 @@ case "${1:-}" in
     install -d -m 0755 /etc/systemd/system/bwvault-agent.service.d
     printf '[Service]\nLoadCredentialEncrypted=bwvault-master:/etc/bwvault/master.cred\n' \
       > /etc/systemd/system/bwvault-agent.service.d/credential.conf
+    chmod 0644 /etc/systemd/system/bwvault-agent.service.d/credential.conf   # umask 077 のままだと systemd が警告する（秘密は含まない）
     systemctl daemon-reload
     "$0" config set pinentry /usr/local/lib/bwvault/pinentry-bwvault
     "$0" config set lock_timeout "${BWVAULT_LOCK_TIMEOUT:-300}"

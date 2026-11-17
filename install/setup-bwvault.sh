@@ -172,7 +172,11 @@ for i in "${changed[@]}"; do
 done
 
 echo
-echo "できました。bwvault にログイン・解錠が済んでいなければ（端末で）："
-echo "  sudo bwvault-admin login     # マスターパスワード（と、求められれば2段階認証）を入力"
-echo "  sudo bwvault-admin sync"
-echo "  sudo bwvault-admin seal-master"
+if [ -e /etc/bwvault/master.cred ]; then
+  echo "できました。（マスターパスワードの封印は済んでいるので、ほかにやることはありません）"
+else
+  echo "できました。【初めて導入するときだけ】次を、この順に実行してください："
+  echo "  sudo bwvault-admin login          # bwvault 側で Bitwarden にログイン（マスターパスワード、2段階認証）"
+  echo "  sudo bwvault-admin sync"
+  echo "  sudo bwvault-admin seal-master    # マスターパスワードを TPM2 で封印（以降は自動で解錠される）"
+fi
