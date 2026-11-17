@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""rbw のラッパー: PATH の先頭に置くと、`rbw` を呼ぶツール（rofi-rbw・bw-autotype など）が bwvault の門につながる。
+
+- 既定のプロファイルを vault にする（RBW_PROFILE が指定済みならそれに従う）。実体は root 所有の /usr/local/lib/bwvault/rbw。
+- get は bwv get に差し替える（秘密の取り出しは、項目ごとの本人確認がある門の GetEntry だけ）。
+- list・sync の前後に、門から暗号化された項目の写しを取り直す（bwv-pull。rbw list が読む DB を最新にする）。
+- add は bwv add に差し替える（暗号化と送信は門が行い、本人確認がある）。edit・remove は、まだ使えない。
+- code は bwv code に差し替える（TOTP のコードは、本人確認のあと、手元で計算する）。
+- search は、全項目のノートを復号して探すので、使えない。
+それ以外はそのまま実体に渡す。
+"""
+import os
+import subprocess
+import sys
+
+REAL = os.environ.get("BWV_REAL_RBW", "/usr/local/lib/bwvault/rbw")
+BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin")
+PULL, BWV = os.path.join(BIN, "bwv-pull"), os.path.join(BIN, "bwv")
+
+os.environ.setdefault("RBW_PROFILE", "vault")
+args = sys.argv[1:]
+sub = args[0] if args else ""
+
+
+def die(msg):
+    print(f"rbw (bwvault): {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+if sub == "get":
+    os.execv(BWV, [BWV, "get", *args[1:]])
+if sub == "code":
+    os.execv(BWV, [BWV, "code", *args[1:]])
+if sub == "search":
+    die("search は、全項目のノートを復号して探すため、使えません / 'search' is not available (it would decrypt the notes of every item)")
+if sub == "add":
+    os.execv(BWV, [BWV, "add", *args[1:]])
+if sub in ("edit", "remove", "rm"):
+    die(f"{sub} は、まだ bwvault に対応していません / '{sub}' is not supported by bwvault yet")
+
+subprocess.run([PULL, "--init-only"])
+if sub == "sync":
+    rc = subprocess.run([REAL, *args]).returncode
+    if rc == 0:
+        subprocess.run([PULL])
+    sys.exit(rc)
+if sub == "list":
+    subprocess.run([PULL])
+os.execv(REAL, [REAL, *args])

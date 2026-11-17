@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""pinentry-bwvault: rbw-agent が pinentry として呼ぶ。画面は出さず、封印されたマスターパスワードを返す。
+
+パスワードは systemd の暗号化クレデンシャル（bwvault-agent.service の LoadCredentialEncrypted=。TPM2 とホスト鍵で封印）で、
+サービスの $CREDENTIALS_DIRECTORY/bwvault-master に、bwvault だけが読める形で置かれる。rbw との会話は Assuan:
+挨拶と、GETPIN 以外の各コマンドに OK を返し、GETPIN には `D <パスワード（% 符号化）>` と OK を返す。
+"""
+import os
+import sys
+
+
+def encode(pw: bytes) -> bytes:
+    return pw.replace(b"%", b"%25").replace(b"\r", b"%0D").replace(b"\n", b"%0A")
+
+
+def main():
+    out = sys.stdout.buffer
+    out.write(b"OK bwvault pinentry\n")
+    out.flush()
+    for line in sys.stdin.buffer:
+        cmd = line.split(b" ", 1)[0].strip()
+        if cmd == b"GETPIN":
+            try:
+                with open(os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "bwvault-master"), "rb") as f:
+                    pw = f.read()
+            except (KeyError, OSError):
+                out.write(b"ERR 83886360 master password credential is not available\n")
+                out.flush()
+                return 1
+            out.write(b"D " + encode(pw) + b"\nOK\n")
+            out.flush()
+            return 0
+        out.write(b"OK\n")
+        out.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

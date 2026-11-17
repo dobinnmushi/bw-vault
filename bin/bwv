@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""bwv: bwvault の門から項目の秘密を取り出す。`rbw get` の代わり（vault プロファイル用）。
+
+  bwv get [--raw] [-i] [--folder F] 名前または UUID [ユーザー名]
+  bwv code [-i] [--folder F] 名前または UUID [ユーザー名]   TOTP のコード（rofi-rbw が rbw code で呼ぶ）
+  bwv add [--uri U] [--folder F] 名前 [ユーザー名]    標準入力の1行目がパスワード、残りがノート（rbw add と同じ）
+  bwv add --ssh [--folder F] 名前                      標準入力は JSON {"private_key","public_key","fingerprint"}
+
+項目の探し方は rbw get と同じ（名前が完全一致 → 部分一致の順、ユーザー名・フォルダで絞る）。ただし探すのは
+`rbw list --raw`（項目名・ユーザー名・フォルダ・URI。確認不要の欄）だけで行い、見つけた項目の ID を門に渡す。
+門が、その項目の名前を出した本人確認（指紋・パスワード）をしてから、その項目の全欄を返す。
+--raw は rbw get --raw と同じ JSON、なしはパスワード（カードは番号）だけを出す。
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+
+GATE_SOCK = os.environ.get("BWVAULT_GATE_SOCKET", "/run/bwvault-gate/gate.sock")
+RBW = os.environ.get("BWV_RBW", "rbw")
+
+
+def die(msg, code=1):
+    print(f"bwv: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def list_entries():
+    env = dict(os.environ)
+    env.setdefault("RBW_PROFILE", "vault")
+    r = subprocess.run([RBW, "list", "--raw"], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        die(f"rbw list に失敗しました: {r.stderr.strip()}")
+    return json.loads(r.stdout)
+
+
+def matcher(ignore_case, exact):
+    def norm(s):
+        return s.lower() if ignore_case else s
+    return (lambda field, term: norm(field) == norm(term)) if exact else (lambda field, term: norm(term) in norm(field))
+
+
+def matches(e, needle, user, folder, ignore_case, strict_user, strict_folder, exact):
+    """rbw の DecryptedSearchCipher::matches と同じ規則"""
+    m = matcher(ignore_case, exact)
+    ef, eu = e.get("folder"), e.get("user")
+    if ef is not None and folder is not None:
+        if not m(ef, folder):
+            return False
+    elif ef is not None and folder is None:
+        if strict_folder:
+            return False
+    elif ef is None and folder is not None:
+        return False
+    if eu is not None and user is not None:
+        if not m(eu, user):
+            return False
+    elif eu is not None and user is None:
+        if strict_user:
+            return False
+    elif eu is None and user is not None:
+        return False
+    kind, value = needle
+    if kind == "uuid":
+        return str(e["id"]).lower() == str(value).lower() or m(e["name"], str(value))
+    return m(e["name"], value)
+
+
+def find_entry(entries, needle, user, folder, ignore_case):
+    """rbw の find_entry_raw と同じ順序で1件に絞る"""
+    found = []
+    for exact in (True, False):
+        def find(su, sf):
+            return [e for e in entries if matches(e, needle, user, folder, ignore_case, su, sf, exact)]
+        found = find(True, True)
+        if len(found) == 1:
+            return found[0]
+        by_folder, by_user = find(False, True), find(True, False)
+        if len(by_folder) == 1 and len(by_user) != 1:
+            return by_folder[0]
+        if len(by_folder) != 1 and len(by_user) == 1:
+            return by_user[0]
+        found = find(False, False)
+        if len(found) == 1:
+            return found[0]
+    if not found:
+        die("no entry found")
+    die("multiple entries found: " + ", ".join(
+        (f"{e['folder']}/" if e.get("folder") else "") + (f"{e['user']}@" if e.get("user") else "") + e["name"]
+        for e in found))
+
+
+def get_entry(entry_id):
+    res = gate_call({"type": "GetEntry", "id": entry_id})
+    if res.get("type") != "Entry":
+        die(res.get("error", str(res)))
+    return res["entry"]
+
+
+def totp_code(secret, now=None):
+    """TOTP（RFC 6238）のコード。secret は base32 の文字列か、otpauth://totp/...?secret=…&algorithm=…&digits=…&period=… の URI。
+    Steam Guard（steam://）などは扱わない"""
+    secret = secret.strip()
+    algo, digits, period = "SHA1", 6, 30
+    if secret.lower().startswith("otpauth://"):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(secret).query)
+        secret = q.get("secret", [""])[0]
+        algo = q.get("algorithm", [algo])[0].upper()
+        digits = int(q.get("digits", [digits])[0])
+        period = int(q.get("period", [period])[0])
+    elif "://" in secret:
+        raise ValueError("unsupported TOTP format")
+    if algo not in ("SHA1", "SHA256", "SHA512") or not 4 <= digits <= 10 or period <= 0:
+        raise ValueError("unsupported TOTP parameters")
+    key = base64.b32decode("".join(secret.split()).upper().rstrip("=") + "=" * (-len("".join(secret.split()).rstrip("=")) % 8))
+    counter = int((time.time() if now is None else now) // period)
+    mac = hmac.new(key, struct.pack(">Q", counter), getattr(hashlib, algo.lower())).digest()
+    off = mac[-1] & 0x0F
+    return str((struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+def gate_call(action, timeout=150):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(timeout)
+        s.connect(GATE_SOCK)
+        s.sendall(json.dumps({"tty": None, "environment": None, "action": action}).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf)
+
+
+def parse_editor(contents):
+    """rbw の parse_editor と同じ: 1行目がパスワード、空行を飛ばした残りがノート（# で始まる行は除く）"""
+    lines = contents.splitlines()
+    password = lines[0] if lines else None
+    rest = lines[1:]
+    while rest and rest[0] == "":
+        rest.pop(0)
+    notes = "\n".join(l for l in rest if not l.startswith("#")).rstrip("\n")
+    return password, notes or None
+
+
+def cmd_add(a):
+    stdin = sys.stdin.read()
+    if a.ssh:
+        try:
+            k = json.loads(stdin)
+            action = {"type": "AddEntry", "kind": "ssh", "name": a.name, "folder": a.folder,
+                      "private_key": k["private_key"], "public_key": k["public_key"], "fingerprint": k["fingerprint"]}
+        except (ValueError, KeyError, TypeError):
+            die("標準入力は {\"private_key\", \"public_key\", \"fingerprint\"} の JSON にしてください")
+    else:
+        password, notes = parse_editor(stdin)
+        action = {"type": "AddEntry", "kind": "login", "name": a.name, "user": a.user, "uri": a.uri,
+                  "folder": a.folder, "password": password, "notes": notes}
+    res = gate_call(action)
+    if res.get("type") != "Ack":
+        die(res.get("error", str(res)))
+    subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "bwv-pull")])   # 新しい項目を rbw list に見せる
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bwv")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("get")
+    g.add_argument("needle")
+    g.add_argument("user", nargs="?")
+    g.add_argument("--folder")
+    g.add_argument("--raw", action="store_true")
+    g.add_argument("-i", "--ignore-case", action="store_true")
+    c = sub.add_parser("code")
+    c.add_argument("needle")
+    c.add_argument("user", nargs="?")
+    c.add_argument("--folder")
+    c.add_argument("-i", "--ignore-case", action="store_true")
+    ad = sub.add_parser("add")
+    ad.add_argument("name")
+    ad.add_argument("user", nargs="?")
+    ad.add_argument("--uri")
+    ad.add_argument("--folder")
+    ad.add_argument("--ssh", action="store_true")
+    a = ap.parse_args()
+    if a.cmd == "add":
+        return cmd_add(a)
+
+    try:
+        needle = ("uuid", str(uuid.UUID(a.needle))) if len(a.needle) == 36 else ("name", a.needle)
+    except ValueError:
+        needle = ("name", a.needle)
+    e = find_entry(list_entries(), needle, a.user, a.folder, a.ignore_case)
+    entry = get_entry(e["id"])
+    if a.cmd == "code":
+        secret = (entry.get("data") or {}).get("totp")
+        if not secret:
+            die(f"entry for '{a.needle}' had no totp secret")
+        try:
+            print(totp_code(secret))
+        except (ValueError, TypeError) as ex:
+            die(f"could not generate the code: {ex}")
+        return
+    if a.raw:
+        json.dump(entry, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return
+    data = entry.get("data") or {}
+    secret = data.get("password") if "password" in data else data.get("number")
+    if secret is None:
+        die(f"entry for '{a.needle}' had no password")
+    print(secret)
+
+
+if __name__ == "__main__":
+    main()

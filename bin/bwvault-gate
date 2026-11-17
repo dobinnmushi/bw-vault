@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""bwvault-gate: bwvault の rbw-agent の前に置く門。専用ユーザー bwvault の system サービスとして動く。
+
+あなたのユーザーのプログラム（rbw など）は rbw-agent のソケットに直接つなげない。つなげるのはこの門のソケットだけで、
+門は rbw と同じ JSON 行のプロトコルを話す。要求ごとに次のように扱う。
+
+- 項目名・ユーザー名・URI・フォルダ名の復号（rbw list が使う欄）と、パスキーの一覧: 「一覧」の polkit 確認（list）を通してから通す。
+  承認はユーザー全体で LIST_SECONDS 秒の窓（1回の操作で、bw-autotype・rofi-rbw・rbw list が別々のプロセスから一覧を取るため）。
+  窓の間に見えるのは名前の一覧だけで、秘密は出ない。
+- それ以外の復号（パスワード・TOTP・ノート・カード・SSH 秘密鍵・隠しフィールド・履歴）: Decrypt では通さない。
+  許可する暗号文は「門が自分の DB から集めた、項目名などの暗号文」の許可リストで決める。リストにないものは秘密として扱う。
+  標準の rbw get は、探す段階で全項目のノートを復号するので、項目ごとの確認と両立しない。
+- GetEntry（門独自）: 項目の ID を指定して、その項目の全欄を復号して返す（rbw get --raw と同じ形）。
+  polkit の確認は「プロセス（pid と起動時刻）＋項目」ごとに1回で、確認画面にはその項目名を出す。
+  同じプロセスが同じ項目をもう一度頼むときだけ、GROUP_SECONDS 秒は聞かない。別の項目は必ず聞き直す。
+- 施錠されていたら、使われた時点で agent を解錠させる（agent の pinentry は pinentry-bwvault で、封印されたマスターパスワードを返す）。
+  解錠そのものは秘密を出さないので、本人確認は要らない。秘密を出す GetEntry だけが本人確認を通る。
+- AddEntry（門独自）: ログイン項目か SSH 鍵項目を新規に作る。暗号化は agent に頼み、Bitwarden の API へは門が送る
+  （アクセストークンは bwvault の DB にしかない）。polkit の確認（write）を通ってから行う。
+- PasskeyList / PasskeyGet / AddEntry(kind=passkey)（門独自。bw-passkey 用）: パスキーの一覧（サイト名・ユーザー名・credentialId など。
+  秘密鍵を含まない）は確認なしで返し、秘密鍵は PasskeyGet でパスキー1つごとに polkit の確認を通してから返す。
+  保管庫の生のデータ（/sync）は、トークンを持つ門が取る。
+- SSH エージェント（SSH_AUTH_SOCK がここを指す）: 鍵の一覧は通し、署名は polkit の確認（ssh-sign）を通してから agent に渡す。
+  確認画面には鍵の項目名と、入ろうとしているユーザー名を出す。承認は「親プロセス＋鍵」ごとに SSH_GROUP_SECONDS 秒
+  （git push が ssh を何度か起動しても、同じ git の子なら聞き直さない。別のプログラムが起動した ssh は通らない）。
+- 暗号化・ログイン・終了など、それ以外の要求は断る。
+- ExportDb（門独自）: トークンと鍵を除いた項目の写しを返す。あなたの側の rbw の DB（rbw list が読むファイル）に使う。
+
+要求元の pid と uid は、ソケットの接続相手を kernel が教える SO_PEERCRED で得る（偽れない）。許可する uid は
+BWVAULT_ALLOWED_UID の1人だけ。rbw-agent に渡す要求には、あなたの環境変数（画面など）を付けない。
+"""
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import socketserver
+import struct
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+AGENT_SOCK = os.environ.get("BWVAULT_AGENT_SOCKET", "/run/bwvault/rbw/socket")
+GATE_SOCK = os.environ.get("BWVAULT_GATE_SOCKET", "/run/bwvault-gate/gate.sock")
+DB_DIR = os.environ.get("BWVAULT_DB_DIR", "/var/lib/bwvault/cache/rbw")
+ALLOWED_UID = int(os.environ.get("BWVAULT_ALLOWED_UID", "-1"))
+GROUP_SECONDS = float(os.environ.get("BWVAULT_GROUP_SECONDS", "10"))
+POLKIT_TIMEOUT_MS = 120_000
+ACTION_SECRET = "io.github.dobinnmushi.bwvault.secret"
+ACTION_WRITE = "io.github.dobinnmushi.bwvault.write"
+ACTION_SSH = "io.github.dobinnmushi.bwvault.ssh-sign"
+ACTION_LIST = "io.github.dobinnmushi.bwvault.list"
+LIST_SECONDS = float(os.environ.get("BWVAULT_LIST_SECONDS", "20"))
+SSH_SOCK = os.environ.get("BWVAULT_SSH_SOCKET", "/run/bwvault-gate/ssh-agent.sock")
+AGENT_SSH_SOCK = os.environ.get("BWVAULT_AGENT_SSH_SOCKET", "/run/bwvault/rbw/ssh-agent-socket")
+SSH_GROUP_SECONDS = float(os.environ.get("BWVAULT_SSH_GROUP_SECONDS", "30"))
+RBW_CONFIG = os.environ.get("BWVAULT_RBW_CONFIG", "/var/lib/bwvault/config/rbw/config.json")
+CLIENT_VERSION = "2024.12.0"      # rbw と同じ値（rbw の src/api.rs）
+
+CIPHERSTRING = re.compile(r"^\d\.")
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def error(msg):
+    return {"type": "Error", "error": msg}
+
+
+# ---- rbw-agent ----
+
+def agent_call(action):
+    """rbw-agent に1つ要求して、答え（辞書）を返す。環境変数は付けない"""
+    req = {"tty": None, "environment": {"tty": None, "env_vars": []}, "action": action}
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(120)
+        s.connect(AGENT_SOCK)
+        s.sendall(json.dumps(req).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf)
+
+
+_unlock_lock = threading.Lock()
+
+
+def ensure_unlocked():
+    """施錠されていたら解錠させる。同時に何本も解錠が走らないよう直列にする"""
+    if agent_call({"type": "CheckLock"}).get("type") == "Ack":
+        return
+    with _unlock_lock:
+        if agent_call({"type": "CheckLock"}).get("type") == "Ack":
+            return
+        r = agent_call({"type": "Unlock"})
+        if r.get("type") != "Ack":
+            raise RuntimeError(r.get("error", "unlock failed"))
+        log("解錠しました")
+
+
+# ---- 項目の索引（門が自分の DB から作る。あなたの側のファイルは見ない）----
+
+def walk(v):
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from walk(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from walk(x)
+
+
+class Index:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stamp = None
+        self.db = None
+        self.free = set()
+        self.owner = {}      # 秘密の暗号文 -> 項目（辞書）
+        self.by_id = {}      # 項目 id -> 項目（辞書）
+        self.names = {}      # 項目 id -> 復号した項目名（確認画面に出す）
+
+    def _path(self):
+        names = [n for n in os.listdir(DB_DIR) if n.endswith(".json")]
+        if len(names) != 1:
+            raise RuntimeError(f"DB が1つに決まりません: {names}")
+        return os.path.join(DB_DIR, names[0])
+
+    def refresh(self):
+        with self.lock:
+            path = self._path()
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size)
+            if stamp == self.stamp:
+                return
+            try:
+                with open(path) as f:
+                    db = json.load(f)
+            except ValueError:
+                # rbw は DB を書きながら読ませることがある。読めなければ前の索引のままにして、次の要求でやり直す
+                if self.db is None:
+                    raise
+                return
+            free, owner = set(), {}
+            for e in db.get("entries", []):
+                mine = set()
+                for s in (e.get("name"), e.get("folder")):
+                    if s:
+                        mine.add(s)
+                login = e.get("data", {}).get("Login") if isinstance(e.get("data"), dict) else None
+                if login:
+                    if login.get("username"):
+                        mine.add(login["username"])
+                    for u in login.get("uris") or []:
+                        if isinstance(u, dict) and u.get("uri"):
+                            mine.add(u["uri"])
+                free |= mine
+                for s in walk(e):
+                    if CIPHERSTRING.match(s) and s not in mine:
+                        owner[s] = e
+            self.by_id = {e.get("id"): e for e in db.get("entries", [])}
+            self.db, self.free, self.owner, self.stamp = db, free, owner, stamp
+
+    def export(self):
+        """トークンと鍵を除いた写し（暗号化された項目だけ）"""
+        self.refresh()
+        return {
+            "access_token": None, "refresh_token": None, "kdf": None, "iterations": None,
+            "memory": None, "parallelism": None, "protected_key": None,
+            "protected_private_key": None, "protected_org_keys": {},
+            "entries": self.db.get("entries", []),
+        }
+
+    def item_name(self, entry):
+        eid = entry.get("id")
+        if eid not in self.names:
+            r = agent_call({"type": "Decrypt", "cipherstring": entry["name"],
+                            "entry_key": entry.get("key"), "org_id": entry.get("org_id")})
+            self.names[eid] = r.get("plaintext") if r.get("type") == "Decrypt" else "(名前を復号できません)"
+        return self.names[eid]
+
+
+INDEX = Index()
+
+
+# ---- polkit ----
+
+_bus = None
+_bus_lock = threading.Lock()
+
+
+def polkit_check(pid, start, action_id, details):
+    from gi.repository import Gio, GLib
+    global _bus
+    with _bus_lock:
+        if _bus is None:
+            _bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+    subject = ("unix-process", {"pid": GLib.Variant("u", pid), "start-time": GLib.Variant("t", start)})
+    params = GLib.Variant("((sa{sv})sa{ss}us)", (subject, action_id, details, 1, ""))  # 1 = 画面で確認してよい
+    res = _bus.call_sync("org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+                         "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization", params,
+                         GLib.VariantType("((bba{ss}))"), Gio.DBusCallFlags.NONE, POLKIT_TIMEOUT_MS, None)
+    return bool(res.unpack()[0][0])
+
+
+def start_time(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        s = f.read()
+    return int(s[s.rindex(")") + 2:].split()[19])  # 22 番目の欄 = 起動時刻（clock tick）
+
+
+def describe(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+    except OSError:
+        comm = "?"
+    return f"{comm} (pid {pid})"
+
+
+_approved = {}          # (pid, 起動時刻, 項目 id) -> 期限
+_approved_lock = threading.Lock()
+_key_locks = {}
+
+
+def authorize(pid, subject, action_id, item_fn, group=None, seconds=None):
+    """このプロセスが subject（項目の id など）について action_id を実行してよいか。承認は subject ごと。
+    同じ subject の再要求だけ、まとめ期間内なら聞かない。item_fn() は確認画面に出す項目名"""
+    start = start_time(pid)
+    gpid, gstart = group or (pid, start)     # 承認を結び付けるプロセス（既定は要求元そのもの）
+    key = (gpid, gstart, action_id, subject)
+    with _approved_lock:
+        klock = _key_locks.setdefault(key, threading.Lock())
+    with klock:   # 同じプロセスが同じ対象を重ねて頼んでも、確認の画面は1回だけ
+        now = time.monotonic()
+        with _approved_lock:
+            for k in [k for k, t in _approved.items() if t < now]:
+                _approved.pop(k, None)
+                _key_locks.pop(k, None)
+            if _approved.get(key, 0) > now:
+                return True
+        item = item_fn()
+        ok = polkit_check(pid, start, action_id, {"item": item, "requester": describe(pid)})
+        # 記録（journal）は同じユーザーのプログラムからも読めるので、項目名は書かず、対象の短い識別子だけを残す
+        tag = hashlib.sha256(str(subject).encode()).hexdigest()[:8]
+        log(f"{'許可' if ok else '拒否'}: {describe(pid)} が [{tag}] を要求（{action_id.rsplit('.', 1)[-1]}）")
+        if ok:
+            with _approved_lock:
+                _approved[key] = time.monotonic() + (GROUP_SECONDS if seconds is None else seconds)
+        return ok
+
+
+def authorize_list(pid):
+    """一覧（項目名など）を見せてよいか。承認はプロセスではなくユーザー全体の窓（秘密は出ない）"""
+    return authorize(pid, "list", ACTION_LIST, lambda: "一覧", group=(0, 0), seconds=LIST_SECONDS)
+
+
+# ---- 項目の取り出し（rbw get --raw と同じ形の JSON）----
+
+FIELD_TYPES = {0: "text", 1: "hidden", 2: "boolean", 3: "linked"}
+LOGIN_KEYS = ("username", "password", "totp")
+CARD_KEYS = ("cardholder_name", "number", "brand", "exp_month", "exp_year", "code")
+IDENTITY_KEYS = ("title", "first_name", "middle_name", "last_name", "address1", "address2", "address3", "city",
+                 "state", "postal_code", "country", "phone", "email", "ssn", "license_number", "passport_number",
+                 "username")
+SSHKEY_KEYS = ("public_key", "fingerprint", "private_key")
+
+
+def decrypt_entry(entry):
+    key, org = entry.get("key"), entry.get("org_id")
+
+    def dec(cs, local=False):
+        if cs is None:
+            return None
+        r = agent_call({"type": "Decrypt", "cipherstring": cs,
+                        "entry_key": None if local else key, "org_id": None if local else org})
+        if r.get("type") != "Decrypt":
+            raise RuntimeError(r.get("error", "decrypt failed"))
+        return r["plaintext"]
+
+    def dec_soft(cs):       # rbw は欄の復号に失敗しても None にして続ける
+        try:
+            return dec(cs)
+        except Exception:
+            return None
+
+    data = entry.get("data")
+    if isinstance(data, dict) and "Login" in data:
+        d = data["Login"]
+        out = {k: dec_soft(d.get(k)) for k in LOGIN_KEYS}
+        out["uris"] = [{"uri": dec_soft(u["uri"]), "match_type": u.get("match_type")} for u in d.get("uris") or []]
+    elif isinstance(data, dict) and "Card" in data:
+        out = {k: dec_soft(data["Card"].get(k)) for k in CARD_KEYS}
+    elif isinstance(data, dict) and "Identity" in data:
+        out = {k: dec_soft(data["Identity"].get(k)) for k in IDENTITY_KEYS}
+    elif isinstance(data, dict) and "SshKey" in data:
+        out = {k: dec_soft(data["SshKey"].get(k)) for k in SSHKEY_KEYS}
+    else:
+        out = None          # SecureNote（rbw の出力でも null）
+    return {
+        "id": entry["id"],
+        "folder": dec(entry["folder"], local=True) if entry.get("folder") else None,
+        "name": dec(entry["name"]),
+        "data": out,
+        "fields": [{"name": dec(f.get("name")), "value": dec(f.get("value")),
+                    "type": FIELD_TYPES.get(f.get("ty"))} for f in entry.get("fields") or []],
+        "notes": dec_soft(entry.get("notes")),
+        "history": [{"last_used_date": h["last_used_date"], "password": dec(h["password"])}
+                    for h in entry.get("history") or []],
+    }
+
+
+# ---- 項目の新規作成 ----
+
+def api_url():
+    with open(RBW_CONFIG) as f:
+        url = (json.load(f).get("base_url") or "").rstrip("/")
+    if not url:
+        return "https://api.bitwarden.com"
+    return url if url == "https://api.bitwarden.eu" else f"{url}/api"
+
+
+def api(method, path, body=None):
+    """Bitwarden の API を呼ぶ。トークンが古ければ（401）agent に同期させて取り直し、1回だけやり直す"""
+    def call():
+        INDEX.refresh()
+        req = urllib.request.Request(
+            api_url() + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": f"Bearer {INDEX.db['access_token']}", "Bitwarden-Client-Version": CLIENT_VERSION,
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"null")
+    try:
+        return call()
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise RuntimeError(f"{method} {path}: {e.code}") from None
+    agent_call({"type": "Sync"})
+    return call()
+
+
+def enc(plaintext):
+    if plaintext is None or plaintext == "":
+        return None
+    r = agent_call({"type": "Encrypt", "plaintext": plaintext, "org_id": None})
+    if r.get("type") != "Encrypt":
+        raise RuntimeError(r.get("error", "encrypt failed"))
+    return r["cipherstring"]
+
+
+def folder_id(name):
+    """フォルダ名からその ID。なければ作る。名前が空なら None"""
+    if not name:
+        return None
+    res = api("GET", "/folders")
+    for f in res.get("data") or res.get("Data") or []:
+        cs = f.get("name") or f.get("Name")
+        r = agent_call({"type": "Decrypt", "cipherstring": cs, "entry_key": None, "org_id": None}) if cs else {}
+        if r.get("plaintext") == name:
+            return f.get("id") or f.get("Id")
+    created = api("POST", "/folders", {"name": enc(name)})
+    return created.get("id") or created.get("Id")
+
+
+def text(action, key, limit=65536, required=False):
+    v = action.get(key)
+    if v is None or v == "":
+        if required:
+            raise ValueError(f"{key} is required")
+        return None
+    if not isinstance(v, str) or len(v) > limit:
+        raise ValueError(f"bad {key}")
+    return v
+
+
+def add_entry(action):
+    kind = action.get("kind")
+    name = text(action, "name", 1000, required=True)
+    fid = folder_id(text(action, "folder", 1000))
+    if kind == "login":
+        uri = text(action, "uri", 10000)
+        cipher = {"type": 1, "folderId": fid, "name": enc(name), "notes": enc(text(action, "notes")),
+                  "login": {"Username": enc(text(action, "user", 1000)), "Password": enc(text(action, "password", 10000)),
+                            "Totp": None, "Uris": [{"Uri": enc(uri), "Match": None}] if uri else []}}
+    elif kind == "ssh":
+        cipher = {"type": 5, "folderId": fid, "name": enc(name), "notes": None,
+                  "sshKey": {"privateKey": enc(text(action, "private_key", required=True)),
+                             "publicKey": enc(text(action, "public_key", required=True)),
+                             "keyFingerprint": enc(text(action, "fingerprint", required=True))}}
+    else:
+        raise ValueError("bad kind")
+    api("POST", "/ciphers", cipher)
+    try:
+        agent_call({"type": "Sync"})      # bwvault の DB に新しい項目を取り込む
+    except Exception as e:
+        log(f"同期に失敗: {e}")
+
+# ---- パスキー（Bitwarden の login.fido2Credentials）----
+
+PASSKEY_TTL = 600
+PASSKEY_FIELDS = ("credentialId", "keyType", "keyAlgorithm", "keyCurve", "keyValue", "rpId", "rpName", "userHandle",
+                  "userName", "userDisplayName", "counter", "discoverable")
+
+
+def jget(v, name):
+    """JSON の欄を、先頭が小文字・大文字のどちらでも取る（Bitwarden の API は両方の書き方がありうる）"""
+    if not isinstance(v, dict):
+        return None
+    x = v.get(name)
+    return x if x is not None else v.get(name[:1].upper() + name[1:])
+
+
+def iso_now():
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t % 1 * 1000):03d}Z"
+
+
+class Passkeys:
+    """保管庫の全パスキー。秘密鍵は暗号文のまま持ち、PasskeyGet のときだけ復号する"""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items, self.fetched = {}, 0.0
+
+    def _dec(self, cs, key, org):
+        if not isinstance(cs, str):
+            return None
+        r = agent_call({"type": "Decrypt", "cipherstring": cs, "entry_key": key, "org_id": org})
+        if r.get("type") != "Decrypt":
+            raise RuntimeError(r.get("error", "decrypt failed"))
+        return r["plaintext"]
+
+    def refresh(self):
+        sync = api("GET", "/sync")
+        found = {}
+        for cipher in jget(sync, "ciphers") or []:
+            if jget(cipher, "type") != 1 or jget(cipher, "deletedDate"):
+                continue
+            creds = jget(jget(cipher, "login"), "fido2Credentials")
+            if not isinstance(creds, list):
+                continue
+            key, org = jget(cipher, "key"), jget(cipher, "organizationId")
+            try:
+                item = self._dec(jget(cipher, "name"), key, org) or ""
+            except Exception:
+                item = ""
+            for i, c in enumerate(creds):
+                ref = f"{jget(cipher, 'id')}#{i}"
+                try:
+                    meta = {"ref": ref, "item_name": item}
+                    for k, f in (("rp_id", "rpId"), ("rp_name", "rpName"), ("credential_id", "credentialId"),
+                                 ("user_handle", "userHandle"), ("user_name", "userName"),
+                                 ("user_display_name", "userDisplayName")):
+                        meta[k] = self._dec(jget(c, f), key, org)
+                except Exception as e:
+                    log(f"パスキーを読めません（{ref}）: {type(e).__name__}")
+                    continue
+                found[ref] = {"meta": meta, "enc": c, "key": key, "org": org}
+        with self.lock:
+            self.items, self.fetched = found, time.monotonic()
+        log(f"保管庫のパスキー: {len(found)} 件")
+
+    def listing(self, force):
+        with self.lock:
+            age = time.monotonic() - self.fetched
+        if self.fetched == 0.0 or age > PASSKEY_TTL or (force and age > 10):
+            self.refresh()
+        with self.lock:
+            return [v["meta"] for v in self.items.values()]
+
+    def secret(self, ref):
+        with self.lock:
+            it = self.items.get(ref)
+        if it is None:
+            raise KeyError(ref)
+        c, key, org = it["enc"], it["key"], it["org"]
+        return {k: self._dec(jget(c, f), key, org) for k, f in
+                (("key_value", "keyValue"), ("key_algorithm", "keyAlgorithm"), ("key_curve", "keyCurve"),
+                 ("counter", "counter"), ("discoverable", "discoverable"))}
+
+    def forget(self):
+        with self.lock:
+            self.fetched = 0.0
+
+
+PASSKEYS = Passkeys()
+
+
+def add_passkey(action):
+    """bw-passkey が作った新しいパスキーを、保管庫の新しいログイン項目として保存する（形式は bw-passkey の vault.rs と同じ）"""
+    plain = action.get("credential")
+    if not isinstance(plain, dict) or not set(plain) <= set(PASSKEY_FIELDS) \
+            or not all(v is None or isinstance(v, str) for v in plain.values()) or not plain.get("rpId"):
+        raise ValueError("bad credential")
+
+    def e(v):
+        if v is None:
+            return None
+        r = agent_call({"type": "Encrypt", "plaintext": v, "org_id": None})
+        if r.get("type") != "Encrypt":
+            raise RuntimeError(r.get("error", "encrypt failed"))
+        return r["cipherstring"]
+
+    cred = {k: e(plain.get(k)) for k in PASSKEY_FIELDS}
+    cred["creationDate"] = iso_now()
+    name = text(action, "name", 1000, required=True)
+    cipher = {"type": 1, "folderId": None, "name": e(name), "notes": None,
+              "login": {"username": e(plain.get("userName")), "password": None, "totp": None,
+                        "uris": [{"uri": e(f"https://{plain['rpId']}"), "match": None}], "fido2Credentials": [cred]}}
+    api("POST", "/ciphers", cipher)
+    PASSKEYS.forget()
+    try:
+        agent_call({"type": "Sync"})
+    except Exception as ex:
+        log(f"同期に失敗: {ex}")
+
+# ---- SSH エージェント ----
+
+SSH_FAILURE, SSH_REQUEST_IDENTITIES, SSH_SIGN_REQUEST, SSH_USERAUTH_REQUEST = 5, 11, 13, 50
+
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+
+def ssh_recv(sock):
+    (length,) = struct.unpack(">I", recv_exact(sock, 4))
+    if length > 1 << 20:
+        raise ValueError("message too large")
+    return recv_exact(sock, length)
+
+
+def ssh_send(sock, body):
+    sock.sendall(struct.pack(">I", len(body)) + body)
+
+
+def read_string(buf, pos):
+    (n,) = struct.unpack(">I", buf[pos:pos + 4])
+    if pos + 4 + n > len(buf):
+        raise struct.error("short")
+    return buf[pos + 4:pos + 4 + n], pos + 4 + n
+
+
+class SshKeys:
+    """公開鍵の blob → 保管庫の項目名。DB が変わったら作り直す"""
+    def __init__(self):
+        self.stamp, self.names, self.lock = None, {}, threading.Lock()
+
+    def name_of(self, blob):
+        with self.lock:
+            INDEX.refresh()
+            if INDEX.stamp != self.stamp:
+                names = {}
+                for e in INDEX.db.get("entries", []):
+                    d = e.get("data")
+                    cs = d["SshKey"].get("public_key") if isinstance(d, dict) and "SshKey" in d else None
+                    if not cs:
+                        continue
+                    try:
+                        r = agent_call({"type": "Decrypt", "cipherstring": cs,
+                                        "entry_key": e.get("key"), "org_id": e.get("org_id")})
+                        names[base64.b64decode(r["plaintext"].split()[1])] = INDEX.item_name(e)
+                    except Exception as ex:
+                        log(f"SSH 公開鍵を読めません: {type(ex).__name__}")
+                self.names, self.stamp = names, INDEX.stamp
+            return self.names.get(blob)
+
+
+SSH_KEYS = SshKeys()
+
+
+def parent_of(pid):
+    """(親 pid, 親の起動時刻)。読めなければ None"""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+        ppid = int(st[st.rindex(")") + 2:].split()[1])
+        return ppid, start_time(ppid)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def ssh_sign_allowed(pid, body):
+    """署名の依頼を通してよいか"""
+    try:
+        blob, pos = read_string(body, 1)
+        data, _ = read_string(body, pos)
+    except (IndexError, struct.error):
+        return False
+    user = ""      # 相手のユーザー名は確認画面に出すだけ。ログイン以外の署名（ssh-keygen -Y sign、git のコミット署名）では読めない
+    try:
+        sid, p = read_string(data, 0)
+        if data[p] == SSH_USERAUTH_REQUEST:
+            user = read_string(data, p + 1)[0].decode(errors="replace")
+    except (IndexError, struct.error):
+        pass
+    name = SSH_KEYS.name_of(blob)
+    if name is None:
+        log("署名を断る: 保管庫にない鍵")
+        return False
+    parent = parent_of(pid)
+    item = f"{name}（{user} として）" if user else name
+    return authorize(pid, base64.b64encode(blob).decode(), ACTION_SSH, lambda: item,
+                     group=parent, seconds=SSH_GROUP_SECONDS)
+
+
+class SshHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        pid, uid, _gid = struct.unpack("3i", self.request.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if uid != ALLOWED_UID:
+            return
+        up = None
+        try:
+            while True:
+                body = ssh_recv(self.request)
+                kind = body[0] if body else 0
+                if kind not in (SSH_REQUEST_IDENTITIES, SSH_SIGN_REQUEST):
+                    ssh_send(self.request, bytes([SSH_FAILURE]))     # 鍵の追加・削除・ロックなどは受け付けない
+                    continue
+                ensure_unlocked()
+                if kind == SSH_SIGN_REQUEST and not ssh_sign_allowed(pid, body):
+                    ssh_send(self.request, bytes([SSH_FAILURE]))
+                    continue
+                if up is None:
+                    up = socket.socket(socket.AF_UNIX)
+                    up.settimeout(60)
+                    up.connect(AGENT_SSH_SOCK)
+                ssh_send(up, body)
+                ssh_send(self.request, ssh_recv(up))
+        except EOFError:
+            pass
+        except Exception as e:    # 失敗は「拒否」として返す
+            log(f"ssh error: {type(e).__name__}: {e}")
+            try:
+                ssh_send(self.request, bytes([SSH_FAILURE]))
+            except OSError:
+                pass
+        finally:
+            if up is not None:
+                up.close()
+
+
+class SshServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+# ---- 要求の振り分け ----
+
+def handle_request(pid, action):
+    kind = action.get("type")
+    if kind in ("Version", "Lock", "Sync"):
+        return agent_call({"type": kind})
+    if kind == "Login":
+        return {"type": "Ack"}      # ログインは bwvault 側で済ませてある
+    if kind in ("CheckLock", "Unlock", "GetEntry", "Decrypt", "AddEntry", "PasskeyList", "PasskeyGet"):
+        try:
+            ensure_unlocked()
+        except Exception as e:
+            log(f"解錠できません: {type(e).__name__}: {e}")
+            return error("bwvault is locked and could not be unlocked (sudo bwvault-admin seal-master, journalctl -u bwvault-gate)")
+        if kind in ("CheckLock", "Unlock"):
+            return {"type": "Ack"}
+    if kind == "ExportDb":
+        return {"type": "Db", "db": INDEX.export()}
+    if kind == "GetEntry":
+        INDEX.refresh()
+        entry = INDEX.by_id.get(action.get("id"))
+        if entry is None:
+            return error("no such entry")
+        if not authorize(pid, entry["id"], ACTION_SECRET, lambda: INDEX.item_name(entry)):
+            return error("authorization denied")
+        return {"type": "Entry", "entry": decrypt_entry(entry)}
+    if kind == "PasskeyList":
+        if not authorize_list(pid):
+            return error("authorization denied")
+        try:
+            return {"type": "Passkeys", "passkeys": PASSKEYS.listing(bool(action.get("force")))}
+        except (RuntimeError, OSError, ValueError) as e:
+            log(f"パスキーの一覧に失敗: {type(e).__name__}: {e}")
+            return error(f"could not list passkeys: {e}")
+    if kind == "PasskeyGet":
+        ref = action.get("ref")
+        PASSKEYS.listing(False)
+        it = PASSKEYS.items.get(ref) if isinstance(ref, str) else None
+        if it is None:
+            return error("no such passkey")
+        m = it["meta"]
+        who = m.get("user_name") or m.get("user_display_name") or m.get("item_name") or ""
+        if not authorize(pid, ref, ACTION_SECRET, lambda: f"パスキー {m.get('rp_id')}（{who}）"):
+            return error("authorization denied")
+        try:
+            return {"type": "Passkey", **PASSKEYS.secret(ref)}
+        except (RuntimeError, OSError, KeyError) as e:
+            log(f"パスキーの復号に失敗: {type(e).__name__}: {e}")
+            return error(f"could not decrypt the passkey: {e}")
+    if kind == "AddEntry" and action.get("kind") == "passkey":
+        cred = action.get("credential")
+        label = (cred.get("rpName") or cred.get("rpId") or "") if isinstance(cred, dict) else ""
+        if not authorize(pid, "passkey:" + str(label), ACTION_WRITE, lambda: f"新規登録（パスキー）: {label}"):
+            return error("authorization denied")
+        try:
+            add_passkey(action)
+        except (ValueError, RuntimeError, OSError) as e:
+            log(f"パスキーの登録に失敗: {type(e).__name__}: {e}")
+            return error(f"could not add the passkey: {e}")
+        return {"type": "Ack"}
+    if kind == "AddEntry":
+        name = action.get("name")
+        if not isinstance(name, str):
+            return error("bad request")
+        what = "SSH 鍵" if action.get("kind") == "ssh" else "ログイン"
+        if not authorize(pid, name, ACTION_WRITE, lambda: f"新規登録（{what}）: {name}"):
+            return error("authorization denied")
+        try:
+            add_entry(action)
+        except (ValueError, RuntimeError, OSError) as e:
+            log(f"登録に失敗: {type(e).__name__}: {e}")
+            return error(f"could not add the entry: {e}")
+        return {"type": "Ack"}
+    if kind == "Decrypt":
+        cs = action.get("cipherstring")
+        if not isinstance(cs, str):
+            return error("bad request")
+        INDEX.refresh()
+        if cs not in INDEX.free:
+            # 秘密は GetEntry だけ。ここでは確認も出さずに断る（確認を無限に出させる嫌がらせも防ぐ）
+            return error("secret fields are only available through GetEntry")
+        if not authorize_list(pid):
+            return error("authorization denied")
+        return agent_call({"type": "Decrypt", "cipherstring": cs,
+                           "entry_key": action.get("entry_key"), "org_id": action.get("org_id")})
+    return error(f"{kind} is not allowed")
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def reply(self, obj):
+        self.wfile.write(json.dumps(obj).encode() + b"\n")
+
+    def handle(self):
+        pid, uid, _gid = struct.unpack("3i", self.request.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        try:
+            if uid != ALLOWED_UID:
+                return self.reply(error("not allowed"))
+            line = self.rfile.readline(1 << 20)
+            try:
+                action = json.loads(line)["action"]
+            except (ValueError, KeyError, TypeError):
+                return self.reply(error("bad request"))
+            self.reply(handle_request(pid, action))
+        except Exception as e:   # 失敗は「拒否」として返す（通してしまわない）
+            log(f"error: {type(e).__name__}: {e}")
+            try:
+                self.reply(error("gate error"))
+            except OSError:
+                pass
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def main():
+    if ALLOWED_UID < 0:
+        sys.exit("BWVAULT_ALLOWED_UID が未設定です")
+    try:
+        os.unlink(GATE_SOCK)
+    except FileNotFoundError:
+        pass
+    server = Server(GATE_SOCK, Handler)
+    os.chmod(GATE_SOCK, 0o666)   # 誰でもつなげるが、門が接続相手の uid を確かめる
+    try:
+        os.unlink(SSH_SOCK)
+    except FileNotFoundError:
+        pass
+    ssh_server = SshServer(SSH_SOCK, SshHandler)
+    os.chmod(SSH_SOCK, 0o666)
+    threading.Thread(target=ssh_server.serve_forever, daemon=True).start()
+    log(f"listening on {GATE_SOCK} and {SSH_SOCK} (uid {ALLOWED_UID} only, group {GROUP_SECONDS:g}s, ssh {SSH_GROUP_SECONDS:g}s)")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

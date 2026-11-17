@@ -1,0 +1,37 @@
+[Unit]
+Description=bw-vault: gate in front of bwvault's rbw-agent (polkit check before secrets)
+After=bwvault-agent.service
+Requires=bwvault-agent.service
+
+[Service]
+User=bwvault
+Group=bwvault
+EnvironmentFile=/etc/bwvault/gate.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=bwvault-gate
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/python3 -I /usr/local/lib/bwvault/bwvault-gate
+Restart=always
+RestartSec=1
+UMask=0077
+
+# 隔離（DB は読むだけ。ネットワークは項目の新規作成（Bitwarden の API）にだけ使う。あなたのプロセスの pid・起動時刻を /proc で読むので ProtectProc は既定のまま）
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/var/lib/bwvault
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,35 @@
+#!/bin/bash
+# bwvault の rbw を bwvault として動かす（ログイン・解錠・設定・封印）。sudo で呼ぶ。
+#   sudo bwvault-admin seal-master   マスターパスワードを封印して、自動解錠にする（初回と、パスワードを変えたとき）
+#   sudo bwvault-admin login | unlock | sync | lock | unlocked | list | config show ...
+# login・unlock・register だけ、script で bwvault 所有の端末を作る（pinentry-curses があなたの端末を開けないため）。
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "sudo で実行してください" >&2; exit 1; }
+export HOME=/var/lib/bwvault
+export XDG_RUNTIME_DIR=/run/bwvault
+export XDG_CONFIG_HOME=$HOME/config XDG_CACHE_HOME=$HOME/cache XDG_DATA_HOME=$HOME/data
+case "${1:-}" in
+  # マスターパスワードを systemd-creds（TPM2 + ホスト鍵）で封印し、agent が画面なしで解錠できるようにする
+  seal-master)
+    umask 077
+    read -rsp "Bitwarden のマスターパスワード: " pw; echo
+    [ -n "$pw" ] || { echo "空です" >&2; exit 1; }
+    install -d -m 0755 /etc/bwvault
+    printf '%s' "$pw" | systemd-creds encrypt --name=bwvault-master --with-key=host+tpm2 - /etc/bwvault/master.cred
+    unset pw
+    chmod 0600 /etc/bwvault/master.cred
+    install -d -m 0755 /etc/systemd/system/bwvault-agent.service.d
+    printf '[Service]\nLoadCredentialEncrypted=bwvault-master:/etc/bwvault/master.cred\n' \
+      > /etc/systemd/system/bwvault-agent.service.d/credential.conf
+    systemctl daemon-reload
+    "$0" config set pinentry /usr/local/lib/bwvault/pinentry-bwvault
+    "$0" config set lock_timeout "${BWVAULT_LOCK_TIMEOUT:-300}"
+    systemctl restart bwvault-agent
+    echo "封印しました。agent は、使われたあと ${BWVAULT_LOCK_TIMEOUT:-300} 秒で施錠し、次に使われるときに自動で解錠します。" ;;
+  # マスターパスワードなどを pinentry で入れる操作だけ、bwvault 所有の端末を作る
+  login|unlock|register)
+    cmd=$(printf '%q ' /usr/local/lib/bwvault/rbw "$@")
+    exec runuser -u bwvault -- /usr/bin/script -qefc "$cmd" /dev/null ;;
+  # それ以外は端末なしで直接動かす（パイプやリダイレクトが使える）
+  *) exec runuser -u bwvault -- /usr/local/lib/bwvault/rbw "$@" ;;
+esac

@@ -1,0 +1,17 @@
+[Unit]
+Description=bw-vault: point SSH_AUTH_SOCK at the bwvault gate (a polkit check before every SSH signature)
+# 他の SSH エージェント（OpenSSH・gcr・gpg・旧 bw-ssh-agent）のあとに設定して、最後に勝つ（gcr-ssh-agent.socket と同じ方式）
+After=ssh-agent.socket gcr-ssh-agent.socket gpg-agent-ssh.socket bw-ssh-agent.socket
+Before=graphical-session-pre.target
+# ソケットの unit と同じ位置（sockets.target の仲間）で動かすので、サービスの既定の依存（basic.target のあと）は外す。
+# 外さないと、basic.target が sockets.target のあとなので、起動順の循環になり、起動時に取り消される
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl --user set-environment SSH_AUTH_SOCK=/run/bwvault-gate/ssh-agent.sock
+ExecStop=/usr/bin/systemctl --user unset-environment SSH_AUTH_SOCK
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,44 @@
+[Unit]
+Description=bw-vault: rbw-agent running as the dedicated user bwvault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bwvault
+Group=bwvault
+Environment=HOME=/var/lib/bwvault
+Environment=XDG_RUNTIME_DIR=/run/bwvault
+Environment=XDG_CONFIG_HOME=/var/lib/bwvault/config
+Environment=XDG_CACHE_HOME=/var/lib/bwvault/cache
+Environment=XDG_DATA_HOME=/var/lib/bwvault/data
+RuntimeDirectory=bwvault
+RuntimeDirectoryMode=0700
+StateDirectory=bwvault
+StateDirectoryMode=0700
+ExecStart=/usr/local/lib/bwvault/rbw-agent --no-daemonize
+# rbw config set などが設定の読み直しのために Quit を送る（正常終了）ので、常に起動し直す
+Restart=always
+RestartSec=1
+UMask=0077
+
+# 隔離（ユーザーの家・他のプロセス・カーネルの設定には触れさせない。ネットワークは Bitwarden への同期に要る）
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

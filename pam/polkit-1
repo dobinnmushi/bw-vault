@@ -1,0 +1,14 @@
+#%PAM-1.0
+# bw-vault: polkit の認証だけ、指紋を5回まで試せる（指が乗ったまま次の照合が走り、すぐ失敗と数えられることがあるため余裕を持たせる）ようにする
+# （/usr/lib/pam.d/polkit-1 を上書き。common-auth の指紋が max-tries=1 のため。sudo・ログインには影響しない）
+auth    [success=3 default=ignore]    pam_fprintd.so max-tries=5 timeout=10
+auth    [success=2 default=ignore]    pam_unix.so nullok try_first_pass
+auth    [success=1 default=ignore]    pam_sss.so use_first_pass
+auth    requisite                     pam_deny.so
+auth    required                      pam_permit.so
+auth    optional                      pam_cap.so
+
+@include common-account
+@include common-password
+session       required   pam_env.so readenv=1 user_readenv=0
+@include common-session-noninteractive

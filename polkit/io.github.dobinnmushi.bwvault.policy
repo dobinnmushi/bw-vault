@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>bw-vault</vendor>
+
+  <!-- 一覧（項目名・ユーザー名・URL・フォルダ名・パスキーのサイト名）の表示 -->
+  <action id="io.github.dobinnmushi.bwvault.list">
+    <description>List the items of the Bitwarden vault</description>
+    <message>保管庫の一覧（項目名・ユーザー名・URL）を表示します（要求元: $(requester)）</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:bwvault</annotate>
+  </action>
+
+  <!-- 秘密の欄（パスワード・TOTP・ノート・カード・SSH 秘密鍵・隠しフィールド）の取り出し -->
+  <action id="io.github.dobinnmushi.bwvault.secret">
+    <description>Read a secret from the Bitwarden vault</description>
+    <message>「$(item)」の秘密を取り出します（要求元: $(requester)）</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:bwvault</annotate>
+  </action>
+
+  <!-- SSH 署名 -->
+  <action id="io.github.dobinnmushi.bwvault.ssh-sign">
+    <description>Sign with an SSH key from the Bitwarden vault</description>
+    <message>SSH 鍵「$(item)」で署名します（要求元: $(requester)）</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:bwvault</annotate>
+  </action>
+
+  <!-- 項目の追加・変更・削除 -->
+  <action id="io.github.dobinnmushi.bwvault.write">
+    <description>Change the Bitwarden vault</description>
+    <message>保管庫を書き換えます：$(item)（要求元: $(requester)）</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:bwvault</annotate>
+  </action>
+</policyconfig>
