@@ -139,7 +139,7 @@ So that you notice if a malicious program modified that folder beforehand:
 - The gate talks to Bitwarden's API directly (to create items and list passkeys).
 - During the list approval window, every process of your user can see the list of names. A shorter window means more confirmations.
 - It cannot stop a fake authentication dialog from getting you to type your password (as long as the fingerprint works, there is nothing to type).
-- SSH signing was checked on a real machine only up to `ssh-keygen -Y sign`; logging in to a real server such as GitHub has not been checked.
+- Checked on a real machine (2026-11-18): logging in to GitHub over SSH through the gate (one ed25519 key); the list confirmation and its denial; `rbw code` for one test item (its code matched an independent implementation, and `bwv get` and `rbw code` shared one confirmation). Not checked: other servers and key types, and a real service's code against an authenticator app.
 
 ## Tests
 
