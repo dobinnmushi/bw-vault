@@ -43,6 +43,7 @@ bypassed by the same user), so the key and the ability to decrypt are moved to *
 
 **Protects** (from programs running as your user that have not passed a confirmation):
 - Item secrets: passwords, TOTP, notes, cards, SSH private keys, hidden fields, history, passkey private keys
+- **TOTP secrets never leave the gate**: after you confirm, the gate computes the code itself and returns only the current six digits (`rbw code`); `rbw get --raw` shows a placeholder instead of the secret. A program that gets through one confirmation obtains a code that is valid for seconds, not a secret that works forever
 - The list of item names, usernames, URLs, folder names and passkey sites
 - The encrypted vault key and access token (so the master password cannot be brute-forced offline from a copy)
 - The agent socket, which could decrypt, encrypt and stop the agent on request
@@ -80,7 +81,7 @@ your user                                       bwvault (dedicated user, system 
 | polkit action | When | What the dialog shows | What the approval is bound to, and for how long |
 |---|---|---|---|
 | `…bwvault.list` | The list of item names etc., the list of passkeys, an item without its secrets (username and URIs only: typing or copying just the username) | The requester | **All of your user**, 20 seconds (separate processes fetch the list during one action) |
-| `…bwvault.secret` | Fetching an item, a passkey's private key | The **item name** (for a passkey, the site and username) and the requester | Items: **parent process + item** (rofi-rbw starts `rbw get` and `rbw code` (TOTP) as separate processes one after another); passkeys: **process + passkey**; 10 seconds. A different item always asks again |
+| `…bwvault.secret` | Fetching an item, a TOTP code (`rbw code`), a passkey's private key | The **item name** (for a passkey, the site and username) and the requester | Items: **parent process + item** (rofi-rbw starts `rbw get` and `rbw code` (TOTP) as separate processes one after another); passkeys: **process + passkey**; 10 seconds. A different item always asks again |
 | `…bwvault.write` | Creating an item or a passkey | The kind and name of the new entry (for a passkey, the site it will be bound to: `rpId`), and the requester | Process + name, 10 seconds |
 | `…bwvault.ssh-sign` | An SSH signature | The key's item name and the username being logged in as | **Parent process + key**, 30 seconds (`git push` may start ssh several times; they are children of the same git) |
 
@@ -133,6 +134,7 @@ So that you notice if a malicious program modified that folder beforehand:
 
 - The stock `rbw get` is refused the secret fields (use `bwv get` and `bwv code`; the wrapper substitutes them). `--full`, `--field` and `--clipboard` are not supported.
 - TOTP: base32 and `otpauth://` only (SHA1, SHA256, SHA512). Steam Guard (`steam://`) is not supported.
+- TOTP secrets are write-only through the gate: you can add one when creating a new login (`bwv add --json`, or the TOTP field of bw-autotype's new-login form), but cannot read one back (use the Bitwarden app) or add one to an existing item (editing items is not supported).
 - `rbw edit`, `remove` and `search` do not work. `rbw add` creates login items only (SSH keys go through bw-autotype).
 - Signing in with a passkey needs two confirmations: the list, then the key.
 - If `base_url` is set in your rbw config (the EU cloud, a self-hosted server), `rbw list` without `--raw`, `rbw sync` and `bwv add` print `bwv-pull: base_url を設定した環境は未対応です` and do not refresh your side's copy of the database: rbw names the copy after the server, and `bwv-pull` only writes the `default` one. `rbw list --raw`, `bwv get`, `bwv code`, SSH and passkeys go straight to the gate and do not use that copy, but this setup has not been tested.

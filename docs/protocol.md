@@ -32,7 +32,8 @@
 | `ExportDb` | – | `Db`（`db`: 暗号化された項目の写し） | なし | トークン・保護された鍵は **含まれない**（`null`）。`rbw list` が読む DB の形 |
 | `List` | – | `List`（`entries`） | **`list`** | 一覧を**1回の要求**で返す。`rbw list --raw` と同じ形（`id` `name` `user` `folder` `uris` `type`。名前順）。門が復号して、保管庫が変わる（DB の更新・`Lock`）まで覚えているので、2回目以降は速い（483 件で、項目ごとの復号を往復する約 0.6 秒が、ほぼ 0 になる） |
 | `Decrypt` | `cipherstring`, `entry_key`, `org_id` | `Decrypt`（`plaintext`） | **`list`** | **項目名・ユーザー名・URI・フォルダ名の暗号文だけ**。秘密の欄は `Error`（`secret fields are only available through GetEntry`）。未知の暗号文も同じ |
-| `GetEntry` | `id` | `Entry`（`entry`） | **`secret`**（項目ごと） | `rbw get --raw` と同じ形（下記） |
+| `GetEntry` | `id` | `Entry`（`entry`） | **`secret`**（項目ごと） | `rbw get --raw` と同じ形（下記）。**TOTP の種は返さない**（下記） |
+| `Totp` | `id` | `Totp`（`code`） | **`secret`**（項目ごと。`GetEntry` と同じ鍵なので、同じ親の `GetEntry` と確認を共有する） | 今の TOTP のコード（桁数は 4〜10、既定 6）**だけ**。種は門の中で復号して計算し、外に出さない。TOTP のない項目は、確認を出さずに `Error`（`the entry has no totp`）。古い gate は `Totp` を知らない（`Totp is not allowed`） |
 | `GetEntry` + `"public": true` | `id`、`public` | `Entry`（`entry`） | **`list`**（項目の確認は出ない） | **秘密を除いた欄だけ**（下記）。「ユーザー名だけを入力する」操作で、2回目の確認を出さないため。`public` は真偽値の `true` のときだけ有効（文字列などは、通常の `GetEntry`）。古い gate は `public` を知らず、全欄を返す（項目の確認つき） |
 | `PasskeyList` | `force`（任意） | `Passkeys`（`passkeys`） | **`list`** | 秘密鍵は **含まれない**。gate が 10 分覚えている。`force` は、10 秒より古ければ取り直す |
 | `PasskeyGet` | `ref` | `Passkey` | **`secret`**（パスキーごと） | 秘密鍵（暗号化を外した文字列）を返す |
@@ -46,7 +47,7 @@
  "data": {…}|null, "fields": [{"name": "…", "value": "…", "type": "text|hidden|boolean|linked"|null}],
  "notes": "…"|null, "history": [{"last_used_date": "…", "password": "…"}]}
 ```
-`data` は項目の種類で決まる。Login: `username` `password` `totp` `uris`（`[{"uri", "match_type"}]`）、Card: `cardholder_name` `number` `brand` `exp_month` `exp_year` `code`、
+`data` は項目の種類で決まる。Login: `username` `password` `totp`（種は返さない。TOTP が**ある**ときは、印の文字列 `(hidden by bw-vault: use rbw code)`、ないときは `null`）`uris`（`[{"uri", "match_type"}]`）、Card: `cardholder_name` `number` `brand` `exp_month` `exp_year` `code`、
 Identity: 17 の欄（`title` … `username`）、SshKey: `public_key` `fingerprint` `private_key`、SecureNote: `null`。
 
 **`public: true` のとき**は、形は同じで、**一覧の確認ですでに見える欄だけ**が入る: `id`、`name`、`folder`、Login の `username` と `uris`、SshKey の `public_key` と `fingerprint`
@@ -60,7 +61,10 @@ Identity: 17 の欄（`title` … `username`）、SshKey: `public_key` `fingerpr
 
 ### `AddEntry`
 
-- `kind: "login"`：`name`（必須）、`user`、`uri`、`folder`、`password`、`notes`
+- `kind: "login"`：`name`（必須）、`user`、`uri`、`folder`、`password`、`notes`、`totp`（任意。base32 か `otpauth://` の URI）。
+  `totp` は、全角を半角に、空白を除いて大文字にして（base32 のとき）、計算できるか確かめてから、確認を出す。使えない形は、確認も出さず、フォルダも作らず、
+  `Error`（`bad totp: …`）。保存できたら、`Ack` に `"totp": true` が付く（古い gate は、知らない `totp` を黙って捨てて、印のない `Ack` を返すので、
+  クライアントは、印がなければ「TOTP は保存されなかった」と知らせる）
 - `kind: "ssh"`：`name`（必須）、`folder`、`private_key`・`public_key`・`fingerprint`（必須）
 - `kind: "passkey"`：`name`（必須）、`credential`（`credentialId` `keyType` `keyAlgorithm` `keyCurve` `keyValue` `rpId`（必須）`rpName` `userHandle`
   `userName` `userDisplayName` `counter` `discoverable`。すべて平文の文字列か `null`。ほかのキーは断る）
